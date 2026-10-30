@@ -35,12 +35,20 @@ const CallLog = mongoose.models.CallLog || mongoose.model("CallLog", new mongoos
   recordingUrl: { type: String, default: null }
 }, { timestamps: true }));
 
-// 🔥 DYNAMIC FFMPEG PATH
+// 🔥 DYNAMIC FFMPEG PATH (Updated for Render / Linux using ffmpeg-static)
 if (process.platform === "win32") {
   ffmpeg.setFfmpegPath("C:\\ffmpeg\\bin\\ffmpeg.exe");
   console.log("💻 Running on Local Windows - Loaded C:\\ffmpeg path");
 } else {
-  console.log("🐧 Running on Linux Production Environment - Auto detecting global FFmpeg");
+  try {
+    const ffmpegStatic = require("ffmpeg-static");
+    if (ffmpegStatic) {
+      ffmpeg.setFfmpegPath(ffmpegStatic);
+      console.log("🐧 Running on Linux Production - Loaded ffmpeg-static path");
+    }
+  } catch (e) {
+    console.log("🐧 Running on Linux Production Environment - Auto detecting global FFmpeg");
+  }
 }
 
 // 📁 AUTO CREATE UPLOADS FOLDER IF MISSING
