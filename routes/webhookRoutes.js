@@ -10,7 +10,7 @@ const FormData = require("form-data");
 const crypto = require("crypto");
 
 // 🌐 BASE URL CONFIGURATION
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://unawake-oversized-moneybags.ngrok-free.dev";
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.promiapi.com";
 
 // 🛡 Safe Mongoose Models Resolution
 const ChatMessage = mongoose.models.ChatMessage || require("../models/ChatMessage");
