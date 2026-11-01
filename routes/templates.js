@@ -6,7 +6,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const FormData = require("form-data"); 
-const mongoose = require("mongoose"); // 🟢 Fixed: Mongoose imported here to prevent crash
+const mongoose = require("mongoose");
 
 const Template = require("../models/Template");
 const WhatsAppConfig = require("../models/whatsappConfigModel"); 
@@ -34,8 +34,8 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 }
 });
 
-// Helper function for robust user query filter
-const getUserQueryCondition = (user) => {
+// Helper function for robust user query filter (Strictly targeting Official WhatsApp & Meta Config)
+const getMetaConfigQuery = (user) => {
   const businessScopeId = user.adminId || user.id || user._id;
   const userCond = [{ userId: businessScopeId }, { userId: String(businessScopeId) }];
   if (mongoose.Types.ObjectId.isValid(businessScopeId)) {
@@ -47,7 +47,12 @@ const getUserQueryCondition = (user) => {
       userCond.push({ userId: new mongoose.Types.ObjectId(user.adminId) });
     }
   }
-  return userCond;
+  
+  return {
+    $or: userCond,
+    platform: { $in: ["whatsapp_official", "whatsapp"] },
+    businessAccountId: { $exists: true, $ne: null }
+  };
 };
 
 // =========================================================
@@ -55,8 +60,8 @@ const getUserQueryCondition = (user) => {
 // =========================================================
 router.get("/sync-meta", auth, async (req, res) => {
   try {
-    const userCond = getUserQueryCondition(req.user);
-    const userConfig = await WhatsAppConfig.findOne({ $or: userCond }).sort({ updatedAt: -1 });
+    const queryFilter = getMetaConfigQuery(req.user);
+    const userConfig = await WhatsAppConfig.findOne(queryFilter).sort({ updatedAt: -1 });
 
     if (!userConfig || !userConfig.accessToken || !userConfig.businessAccountId) {
       return res.status(400).json({ 
@@ -198,8 +203,8 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
       status: "PENDING"
     });
 
-    const userCond = getUserQueryCondition(req.user);
-    const userConfig = await WhatsAppConfig.findOne({ $or: userCond }).sort({ updatedAt: -1 });
+    const queryFilter = getMetaConfigQuery(req.user);
+    const userConfig = await WhatsAppConfig.findOne(queryFilter).sort({ updatedAt: -1 });
 
     let metaSyncedStatus = false;
     let metaNotice = "Saved locally on dashboard testing mode.";
@@ -395,8 +400,8 @@ router.delete("/:id", auth, async (req, res) => {
       }
     }
 
-    const userCond = getUserQueryCondition(req.user);
-    const userConfig = await WhatsAppConfig.findOne({ $or: userCond }).sort({ updatedAt: -1 });
+    const queryFilter = getMetaConfigQuery(req.user);
+    const userConfig = await WhatsAppConfig.findOne(queryFilter).sort({ updatedAt: -1 });
 
     if (userConfig && userConfig.accessToken && userConfig.businessAccountId) {
       try {
