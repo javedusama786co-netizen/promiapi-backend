@@ -709,22 +709,6 @@ async function runVoiceVariants({ config, accessToken, to, oggPath }) {
       }
       await new Promise((r) => setTimeout(r, 1500));
     };
-
-    const idA = await uploadVoiceToMeta(config.phoneNumberId, accessToken, oggPath);
-    await send("1: id + voice:true (current)", { type: "audio", audio: { id: idA, voice: true } });
-    await send("2: id, plain audio (no voice flag)", { type: "audio", audio: { id: idA } });
-    await send("3: public link, plain audio", { type: "audio", audio: { link: publicLink } });
-
-    // Variant 4: re-encoded 16kHz/24k (what WhatsApp's own app produces)
-    const out16 = path.join("uploads/", `voice16-${Date.now()}.ogg`);
-    await new Promise((resolve, reject) => {
-      ffmpeg(oggPath).noVideo().audioCodec("libopus").audioChannels(1).audioFrequency(16000).audioBitrate("24k")
-        .outputOptions(["-map_metadata -1"]).toFormat("ogg").on("end", resolve).on("error", reject).save(out16);
-    });
-    const id16 = await uploadVoiceToMeta(config.phoneNumberId, accessToken, out16);
-    await send("4: 16kHz re-encode + voice:true", { type: "audio", audio: { id: id16, voice: true } });
-    await send("5: 16kHz re-encode, plain audio", { type: "audio", audio: { id: id16 } });
-
     // Variant 6: constant-bitrate opus, "audio" application mode (different packet layout from voip/VBR)
     const outCbr = path.join("uploads/", `voicecbr-${Date.now()}.ogg`);
     await new Promise((resolve, reject) => {
@@ -732,17 +716,7 @@ async function runVoiceVariants({ config, accessToken, to, oggPath }) {
         .outputOptions(["-vbr off", "-application audio", "-frame_duration 20", "-map_metadata -1"]).toFormat("ogg")
         .on("end", resolve).on("error", reject).save(outCbr);
     });
-    const idCbr = await uploadVoiceToMeta(config.phoneNumberId, accessToken, outCbr);
-    await send("6: CBR 32k opus + voice:true", { type: "audio", audio: { id: idCbr, voice: true } });
-
-    // Variant 7: AAC .m4a (plays on every phone; shows as normal audio, not a voice bubble)
-    const outM4a = path.join("uploads/", `voiceaac-${Date.now()}.m4a`);
-    await new Promise((resolve, reject) => {
-      ffmpeg(oggPath).noVideo().audioCodec("aac").audioChannels(1).audioFrequency(44100).audioBitrate("64k")
-        .outputOptions(["-movflags +faststart"]).toFormat("ipod").on("end", resolve).on("error", reject).save(outM4a);
-    });
-    const idM4a = await uploadVoiceToMeta(config.phoneNumberId, accessToken, outM4a, "audio/mp4");
-    await send("7: AAC m4a plain audio", { type: "audio", audio: { id: idM4a } });
+  
 
   return log;
 }
