@@ -35,7 +35,7 @@ const getAdminQueryFilter = (businessScopeId) => [
 ];
 
 // Base URL configuration for live public access
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.BACKEND_URL || process.env.SERVER_URL || "https://unawake-oversized-moneybags.ngrok-free.dev";
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || process.env.BACKEND_URL || process.env.SERVER_URL || "https://api.promiapi.com";
 
 // In-memory store for tenant assignment modes
 const tenantAssignmentModes = new Map();
