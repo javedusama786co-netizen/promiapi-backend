@@ -38,8 +38,18 @@ const upload = multer({
 // =========================================================
 router.get("/sync-meta", auth, async (req, res) => {
   try {
-    const businessScopeId = req.user.adminId || req.user.id;
-    const userConfig = await WhatsAppConfig.findOne({ userId: businessScopeId });
+    const businessScopeId = req.user.adminId || req.user.id || req.user._id;
+    
+    // 🟢 Robust Query Filter jo adminId aur userId dono ko check karega
+    const userCond = [{ userId: businessScopeId }, { userId: String(businessScopeId) }];
+    if (mongoose.Types.ObjectId.isValid(businessScopeId)) {
+      userCond.push({ userId: new mongoose.Types.ObjectId(businessScopeId) });
+    }
+    if (req.user.adminId) {
+      userCond.push({ userId: req.user.adminId }, { userId: String(req.user.adminId) });
+    }
+
+    const userConfig = await WhatsAppConfig.findOne({ $or: userCond }).sort({ updatedAt: -1 });
 
     if (!userConfig || !userConfig.accessToken || !userConfig.businessAccountId) {
       return res.status(400).json({ 
@@ -47,6 +57,7 @@ router.get("/sync-meta", auth, async (req, res) => {
         message: "Pehle WhatsApp Cloud API settings dashboard mein apna Token aur Business Account ID save karein!" 
       });
     }
+    // ... باقی کوڈ ویسے ہی رہے گا ...
 
     const response = await axios.get(
       `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?limit=100`,

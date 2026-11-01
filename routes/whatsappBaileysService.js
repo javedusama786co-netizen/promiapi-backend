@@ -26,7 +26,7 @@ const User = safeModel("User", "../models/User");
 const Order = safeModel("Order", "../models/Order");
 
 // ⚙️ CONFIG
-const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://unawake-oversized-moneybags.ngrok-free.dev";
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.promiapi.com";
 const UPLOAD_DIR = path.join(__dirname, "../uploads");
 const BUTTONS_MODE = String(process.env.BAILEYS_BUTTONS_MODE || "text").toLowerCase();
 const PENDING_TTL_MS = 2 * 60 * 60 * 1000;
