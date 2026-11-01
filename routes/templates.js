@@ -6,6 +6,7 @@ const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
 const FormData = require("form-data"); 
+const mongoose = require("mongoose"); // 🟢 Fixed: Mongoose imported here to prevent crash
 
 const Template = require("../models/Template");
 const WhatsAppConfig = require("../models/whatsappConfigModel"); 
