@@ -160,7 +160,7 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
 
     let dynamicMediaUrl = "";
     if (req.file) {
-      dynamicMediaUrl = `https://unawake-oversized-moneybags.ngrok-free.dev/uploads/templates/${req.file.filename}`;
+      dynamicMediaUrl = `https://api.promiapi.com/uploads/templates/${req.file.filename}`;
     }
 
     const savedTemplate = await Template.create({
