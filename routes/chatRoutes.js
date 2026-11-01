@@ -146,33 +146,34 @@ function getMediaType(ext, mimeType) {
   return "document";
 }
 
-// 🎙️ Convert recorded audio to real WhatsApp voice-note (CBR 32k opus setup - Test 6 style)
+// 🎙️ Convert any recorded audio (webm / mp4 / wav / mp3 / ogg) to a REAL WhatsApp voice-note file:
+//    OGG container + OPUS codec + MONO.  (Meta: "base audio/ogg not supported, OPUS only, mono only")
 function convertToWhatsAppVoice(inputPath) {
   return new Promise((resolve, reject) => {
     const outName = `voice-${Date.now()}-${Math.round(Math.random() * 1e9)}.ogg`;
     const outPath = path.join("uploads/", outName);
-    
     ffmpeg(inputPath)
       .noVideo()
       .audioCodec("libopus")
       .audioChannels(1)
-      .audioFrequency(48000)
-      .audioBitrate("32k")
-      .outputOptions([
-        "-vbr off",
-        "-application audio",
-        "-frame_duration 20",
-        "-map_metadata -1"
-      ])
+      .audioFrequency(16000)   // same as WhatsApp's own voice notes
+      .audioBitrate("24k")
+      // NOTE: do NOT add "-application voip" / "-vbr on": files made with them play on
+      // WhatsApp Web but fail on the mobile app ("audio not available").  Verified by A/B test.
+      .outputOptions(["-map_metadata -1"])
       .toFormat("ogg")
       .on("end", () => {
+        // Verify the output really is opus + mono before we ever send it
         ffmpeg.ffprobe(outPath, (probeErr, info) => {
           if (probeErr) {
             console.warn("⚠️ ffprobe unavailable, skipping verification:", probeErr.message);
             return resolve({ outPath, outName, seconds: 1 });
           }
           const a = (info.streams || []).find((st) => st.codec_type === "audio");
-          console.log(`🎙️ Voice converted (CBR 32k): ${outName} codec=${a?.codec_name} ch=${a?.channels} dur=${info.format?.duration}s`);
+          if (!a || a.codec_name !== "opus" || Number(a.channels) !== 1) {
+            return reject(new Error(`Converted file is not mono opus (got ${a?.codec_name}/${a?.channels}ch)`));
+          }
+          console.log(`🎙️ Voice converted: ${outName} codec=${a.codec_name} ch=${a.channels} dur=${info.format?.duration}s size=${info.format?.size}B`);
           resolve({ outPath, outName, seconds: Math.max(1, Math.round(Number(info.format?.duration) || 1)) });
         });
       })
@@ -181,7 +182,7 @@ function convertToWhatsAppVoice(inputPath) {
   });
 }
 
-// 📊 Build a 64-bar waveform (values 0-100) so WhatsApp draws the voice-note graph
+// 📊 Build a 64-bar waveform (values 0-100) so WhatsApp (QR/Baileys) draws the voice-note graph
 function buildVoiceWaveform(filePath, bars = 64) {
   return new Promise((resolve) => {
     const chunks = [];
@@ -208,6 +209,9 @@ function buildVoiceWaveform(filePath, bars = 64) {
   });
 }
 
+// ☁️ Upload the .ogg to Meta /media and return media id.
+//    - whole file is sent from a Buffer (known Content-Length, no chunked stream)
+//    - mime is the full "audio/ogg; codecs=opus" so Meta stores the right type for the WhatsApp client
 const VOICE_MIME = "audio/ogg; codecs=opus";
 const META_GRAPH = "https://graph.facebook.com/v23.0";
 
@@ -223,7 +227,19 @@ async function uploadVoiceToMeta(phoneNumberId, accessToken, oggPath, mime = VOI
     maxBodyLength: Infinity,
     maxContentLength: Infinity
   });
-  return r.data.id;
+  const mediaId = r.data.id;
+
+  // Diagnostic: ask Meta what it actually stored. file_size must equal our local size.
+  try {
+    const info = await axios.get(`${META_GRAPH}/${mediaId}`, { headers: { Authorization: `Bearer ${accessToken}` } });
+    console.log(`🔎 Meta stored media ${mediaId}: mime=${info.data.mime_type} size=${info.data.file_size} (local size=${buf.length})`);
+    if (Number(info.data.file_size) && Number(info.data.file_size) !== buf.length) {
+      console.error("❌ SIZE MISMATCH: Meta received a different number of bytes than we sent (corrupt upload).");
+    }
+  } catch (e) {
+    console.warn("⚠️ Could not read back media info:", e.response?.data?.error?.message || e.message);
+  }
+  return mediaId;
 }
 
 function formatMediaUrlForFrontend(mediaUrl) {
@@ -365,6 +381,7 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
           );
           const isVideo = !isImage && !isAudio && ([".mp4", ".mov", ".avi", ".3gp"].includes(fileExt) || fileMime.startsWith("video/"));
 
+          // Browser mic recording (voice-xxxx.webm / .ogg / .mp4) => real WhatsApp voice note (ptt)
           const isRecordedVoice = isAudio && (/^voice-/i.test(req.file.originalname) || [".webm", ".ogg", ".opus", ".mp4"].includes(fileExt));
 
           if (isImage) {
@@ -377,6 +394,8 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
             try {
               converted = await convertToWhatsAppVoice(req.file.path);
             } catch (ffmpegErr) {
+              // NEVER send the raw browser .webm labelled as ogg - that is what makes WhatsApp say
+              // "This audio is not available because something is wrong with the audio file"
               console.error("❌ FFmpeg voice conversion failed (QR):", ffmpegErr.message);
               return res.status(500).json({ success: false, message: "Voice note convert nahi ho saka (ffmpeg / libopus check karein)." });
             }
@@ -384,6 +403,7 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
             mediaUrl = `/uploads/${converted.outName}`;
             fullMediaUrl = `${PUBLIC_BASE_URL.replace(/\/$/, "")}${mediaUrl}`;
 
+            console.log("🎙️ Voice send via QR/Baileys →", recipientJid, "seconds:", converted.seconds);
             const waveform = await buildVoiceWaveform(converted.outPath);
             sentResult = await sock.sendMessage(recipientJid, {
               audio: fs.readFileSync(converted.outPath),
@@ -437,6 +457,7 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
             try {
               converted = await convertToWhatsAppVoice(req.file.path);
             } catch (ffmpegErr) {
+              // Old code swallowed this error and sent the raw .webm -> WhatsApp "audio file is wrong"
               console.error("❌ FFmpeg voice conversion failed (Cloud API):", ffmpegErr.message);
               return res.status(500).json({ success: false, message: "Voice note convert nahi ho saka (ffmpeg / libopus check karein)." });
             }
@@ -445,9 +466,12 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
             fullMediaUrl = `${PUBLIC_BASE_URL.replace(/\/$/, "")}${mediaUrl}`;
 
             payload.type = "audio";
+            console.log("🎙️ Voice send via Meta Cloud API →", to);
             try {
+              // Upload to Meta and send by media id (no dependency on ngrok / public link / content-type)
               const metaMediaId = await uploadVoiceToMeta(config.phoneNumberId, accessToken, converted.outPath);
               payload.audio = { id: metaMediaId, voice: true };
+              console.log("✅ Meta media uploaded, id:", metaMediaId);
             } catch (upErr) {
               console.warn("⚠️ Meta media upload failed, falling back to link:", upErr.response?.data?.error?.message || upErr.message);
               payload.audio = { link: fullMediaUrl, voice: true };
@@ -471,13 +495,21 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
           payload.text = { preview_url: false, body: text };
         }
 
+        console.log("📤 Meta payload:", JSON.stringify(payload));
         const metaResponse = await axios.post(
           `${META_GRAPH}/${config.phoneNumberId}/messages`,
           payload,
           { headers: { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" } }
         );
 
+        console.log("📨 Meta response:", JSON.stringify(metaResponse.data));
         messageId = metaResponse.data.messages?.[0]?.id;
+
+        if (process.env.WA_VOICE_DEBUG === "1" && calculatedMessageType === "audio" && mediaUrl) {
+          runVoiceVariants({ config, accessToken, to: String(to).replace(/\D/g, ""), oggPath: path.join("uploads/", path.basename(mediaUrl)) })
+            .then((r) => console.log("🧪 voice variants result:", JSON.stringify(r)))
+            .catch((e) => console.error("🧪 voice variants failed:", e.response?.data || e.message));
+        }
       }
 
     } else if (platform === "instagram") {
@@ -656,6 +688,96 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
       message: "Cloud transmission failed.", 
       error: err.response?.data || err.message 
     });
+  }
+});
+
+// 🧪 Sends the same recording in 7 different ways (each preceded by a "TEST n" text) to find what mobile WhatsApp accepts
+async function runVoiceVariants({ config, accessToken, to, oggPath }) {
+  const log = [];
+    const publicLink = `${PUBLIC_BASE_URL.replace(/\/$/, "")}/uploads/${path.basename(oggPath)}`;
+    const headers = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" };
+    const url = `${META_GRAPH}/${config.phoneNumberId}/messages`;
+    const base = { messaging_product: "whatsapp", recipient_type: "individual", to };
+
+    const send = async (label, body) => {
+      try {
+        await axios.post(url, { ...base, type: "text", text: { body: `TEST ${label}` } }, { headers });
+        const r = await axios.post(url, { ...base, ...body }, { headers });
+        log.push({ label, ok: true, id: r.data.messages?.[0]?.id });
+      } catch (e) {
+        log.push({ label, ok: false, error: e.response?.data?.error || e.message });
+      }
+      await new Promise((r) => setTimeout(r, 1500));
+    };
+
+    const idA = await uploadVoiceToMeta(config.phoneNumberId, accessToken, oggPath);
+    await send("1: id + voice:true (current)", { type: "audio", audio: { id: idA, voice: true } });
+    await send("2: id, plain audio (no voice flag)", { type: "audio", audio: { id: idA } });
+    await send("3: public link, plain audio", { type: "audio", audio: { link: publicLink } });
+
+    // Variant 4: re-encoded 16kHz/24k (what WhatsApp's own app produces)
+    const out16 = path.join("uploads/", `voice16-${Date.now()}.ogg`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(oggPath).noVideo().audioCodec("libopus").audioChannels(1).audioFrequency(16000).audioBitrate("24k")
+        .outputOptions(["-map_metadata -1"]).toFormat("ogg").on("end", resolve).on("error", reject).save(out16);
+    });
+    const id16 = await uploadVoiceToMeta(config.phoneNumberId, accessToken, out16);
+    await send("4: 16kHz re-encode + voice:true", { type: "audio", audio: { id: id16, voice: true } });
+    await send("5: 16kHz re-encode, plain audio", { type: "audio", audio: { id: id16 } });
+
+    // Variant 6: constant-bitrate opus, "audio" application mode (different packet layout from voip/VBR)
+    const outCbr = path.join("uploads/", `voicecbr-${Date.now()}.ogg`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(oggPath).noVideo().audioCodec("libopus").audioChannels(1).audioFrequency(48000).audioBitrate("32k")
+        .outputOptions(["-vbr off", "-application audio", "-frame_duration 20", "-map_metadata -1"]).toFormat("ogg")
+        .on("end", resolve).on("error", reject).save(outCbr);
+    });
+    const idCbr = await uploadVoiceToMeta(config.phoneNumberId, accessToken, outCbr);
+    await send("6: CBR 32k opus + voice:true", { type: "audio", audio: { id: idCbr, voice: true } });
+
+    // Variant 7: AAC .m4a (plays on every phone; shows as normal audio, not a voice bubble)
+    const outM4a = path.join("uploads/", `voiceaac-${Date.now()}.m4a`);
+    await new Promise((resolve, reject) => {
+      ffmpeg(oggPath).noVideo().audioCodec("aac").audioChannels(1).audioFrequency(44100).audioBitrate("64k")
+        .outputOptions(["-movflags +faststart"]).toFormat("ipod").on("end", resolve).on("error", reject).save(outM4a);
+    });
+    const idM4a = await uploadVoiceToMeta(config.phoneNumberId, accessToken, outM4a, "audio/mp4");
+    await send("7: AAC m4a plain audio", { type: "audio", audio: { id: idM4a } });
+
+  return log;
+}
+
+// ROUTE: VOICE DIAGNOSTIC - sends the SAME recording in several ways, each one preceded by a text label,
+// so you can see on the phone which variant plays.   POST /api/chats/voice-test   { "to": "923xxxxxxxxx" }
+// (optional "file": "voice-123.ogg" from uploads/ ; default = newest voice-*.ogg)
+router.post("/voice-test", authMiddleware, async (req, res) => {
+  let log = [];
+  try {
+    const to = String(req.body.to || "").replace(/\D/g, "");
+    if (!to) return res.status(400).json({ success: false, message: "'to' required" });
+
+    const businessScopeId = req.user.adminId || req.user.id || req.user._id;
+    const userConditions = getAdminQueryFilter(businessScopeId);
+    const WhatsAppConfig = mongoose.models.WhatsAppConfig || mongoose.model("WhatsAppConfig");
+    const config = await WhatsAppConfig.findOne({
+      $and: [{ $or: userConditions }, { platform: { $in: ["whatsapp", "whatsapp_official"] } }]
+    }).lean();
+    const accessToken = config?.accessToken || process.env.WHATSAPP_TOKEN || process.env.FB_PAGE_ACCESS_TOKEN;
+    if (!config?.phoneNumberId || !accessToken) return res.status(400).json({ success: false, message: "Cloud API credentials missing" });
+
+    let fileName = req.body.file;
+    if (!fileName) {
+      const files = fs.readdirSync("uploads/").filter((f) => /^voice-.*\.ogg$/i.test(f))
+        .map((f) => ({ f, t: fs.statSync(path.join("uploads/", f)).mtimeMs })).sort((a, b) => b.t - a.t);
+      if (!files.length) return res.status(404).json({ success: false, message: "No voice-*.ogg in uploads/" });
+      fileName = files[0].f;
+    }
+    const oggPath = path.join("uploads/", path.basename(fileName));
+    log = await runVoiceVariants({ config, accessToken, to, oggPath });
+    return res.json({ success: true, file: fileName, results: log });
+  } catch (err) {
+    console.error("❌ voice-test failed:", err.response?.data || err.message);
+    return res.status(500).json({ success: false, error: err.response?.data || err.message, results: log });
   }
 });
 
@@ -1027,6 +1149,7 @@ router.post("/whatsapp-call/incoming", async (req, res) => {
 
     const scopeId = businessScopeId || "default_tenant";
 
+    // 1. Database se check karein ke yeh customer kis agent ko assigned hai
     const existingChat = await ChatMessage.findOne({
       $and: [
         { $or: [{ userId: scopeId }, { adminId: scopeId }] },
@@ -1036,6 +1159,7 @@ router.post("/whatsapp-call/incoming", async (req, res) => {
 
     const assignedAgentId = existingChat?.assignedTo ? String(existingChat.assignedTo) : null;
 
+    // Call Log Entry create karein
     const newCall = new CallLog({
       userId: scopeId,
       callId: callId,
@@ -1055,6 +1179,7 @@ router.post("/whatsapp-call/incoming", async (req, res) => {
       timestamp: new Date()
     };
 
+    // 2. Targeted Routing: Sirf assigned agent ko signal bhejein
     if (reqIo) {
       if (assignedAgentId && assignedAgentId !== "none") {
         reqIo.to(`agent_${assignedAgentId}`).emit("incoming_whatsapp_call", callPayload);
@@ -1064,6 +1189,7 @@ router.post("/whatsapp-call/incoming", async (req, res) => {
         console.log(`📡 [CALL ROUTED] Unassigned Call sent to Admin`);
       }
 
+      // 3. System 2: 15 Seconds Timeout Auto-Forwarding Logic
       setTimeout(async () => {
         const checkCallStatus = await CallLog.findOne({ callId }).lean();
         if (checkCallStatus && checkCallStatus.status === "ringing") {
@@ -1071,12 +1197,13 @@ router.post("/whatsapp-call/incoming", async (req, res) => {
           
           await CallLog.updateOne({ callId }, { $set: { status: "forwarded_to_admin" } });
 
+          // Forward event emit karein
           reqIo.to(`admin_${scopeId}`).emit("incoming_whatsapp_call_forwarded", {
             ...callPayload,
             reason: "Assigned agent missed the call"
           });
         }
-      }, 15000);
+      }, 15000); // 15 Seconds
     }
 
     return res.status(200).json({
