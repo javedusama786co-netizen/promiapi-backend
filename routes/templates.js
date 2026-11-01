@@ -33,31 +33,36 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 }
 });
 
+// Helper function for robust user query filter
+const getUserQueryCondition = (user) => {
+  const businessScopeId = user.adminId || user.id || user._id;
+  const userCond = [{ userId: businessScopeId }, { userId: String(businessScopeId) }];
+  if (mongoose.Types.ObjectId.isValid(businessScopeId)) {
+    userCond.push({ userId: new mongoose.Types.ObjectId(businessScopeId) });
+  }
+  if (user.adminId) {
+    userCond.push({ userId: user.adminId }, { userId: String(user.adminId) });
+    if (mongoose.Types.ObjectId.isValid(user.adminId)) {
+      userCond.push({ userId: new mongoose.Types.ObjectId(user.adminId) });
+    }
+  }
+  return userCond;
+};
+
 // =========================================================
 // 1. 🔄 META TEMPLATES SYNC
 // =========================================================
 router.get("/sync-meta", auth, async (req, res) => {
   try {
-    const businessScopeId = req.user.adminId || req.user.id || req.user._id;
-    
-    // 🟢 Robust Query Filter jo adminId aur userId dono ko check karega
-    const userCond = [{ userId: businessScopeId }, { userId: String(businessScopeId) }];
-    if (mongoose.Types.ObjectId.isValid(businessScopeId)) {
-      userCond.push({ userId: new mongoose.Types.ObjectId(businessScopeId) });
-    }
-    if (req.user.adminId) {
-      userCond.push({ userId: req.user.adminId }, { userId: String(req.user.adminId) });
-    }
-
+    const userCond = getUserQueryCondition(req.user);
     const userConfig = await WhatsAppConfig.findOne({ $or: userCond }).sort({ updatedAt: -1 });
 
     if (!userConfig || !userConfig.accessToken || !userConfig.businessAccountId) {
       return res.status(400).json({ 
         success: false, 
-        message: "Pehle WhatsApp Cloud API settings dashboard mein apna Token aur Business Account ID save karein!" 
+        message: "Please save your Token and Business Account ID in the dashboard WhatsApp Cloud API settings first!" 
       });
     }
-    // ... باقی کوڈ ویسے ہی رہے گا ...
 
     const response = await axios.get(
       `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?limit=100`,
@@ -66,6 +71,8 @@ router.get("/sync-meta", auth, async (req, res) => {
 
     const metaTemplates = response.data?.data || [];
     const savedTemplates = [];
+
+    const businessScopeId = req.user.adminId || req.user.id;
 
     for (const mt of metaTemplates) {
       if (!mt.name) continue;
@@ -162,7 +169,6 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
       try { parsedButtons = JSON.parse(req.body.buttons); } catch (e) { parsedButtons = []; }
     }
 
-    // 🟢 CLEAN NAME FIX: Microtime & random seeds removed to avoid spam rejection
     const templateCleanName = (title || "template")
       .toLowerCase()
       .trim()
@@ -191,14 +197,15 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
       status: "PENDING"
     });
 
-    const userConfig = await WhatsAppConfig.findOne({ userId: businessScopeId });
+    const userCond = getUserQueryCondition(req.user);
+    const userConfig = await WhatsAppConfig.findOne({ $or: userCond }).sort({ updatedAt: -1 });
+
     let metaSyncedStatus = false;
     let metaNotice = "Saved locally on dashboard testing mode.";
 
     if (userConfig && userConfig.accessToken && userConfig.businessAccountId) {
       const metaComponents = [];
 
-      // 1. Header Component (Updated with dynamic variable matching)
       if (headerType === "text" && headerText) {
         const headerComponentObj = { 
           type: "HEADER", 
@@ -304,7 +311,6 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
         }
       }
 
-      // 2. Body Component & Sample Variable Injection
       const bodyComponent = { type: "BODY", text: content };
 
       const matches = content.match(/\{\{\d+\}\}/g);
@@ -316,12 +322,10 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
       }
       metaComponents.push(bodyComponent);
 
-      // 3. Footer Component
       if (footerText && footerText.trim() !== "") {
         metaComponents.push({ type: "FOOTER", text: footerText.trim() });
       }
 
-      // 4. Buttons Component
       if (parsedButtons && parsedButtons.length > 0) {
         const formattedButtons = parsedButtons.map((btn) => {
           if (btn.buttonType === "url") return { type: "URL", text: btn.buttonText, url: btn.value };
@@ -371,7 +375,7 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
 });
 
 // =========================================================
-// 4. 🗑️ DELETE TEMPLATE
+// 4. 🗑️ DELETE TEMPLATE (Updated with Robust User Config & Meta Delete)
 // =========================================================
 router.delete("/:id", auth, async (req, res) => {
   try {
@@ -379,7 +383,7 @@ router.delete("/:id", auth, async (req, res) => {
     const targetTemplate = await Template.findOne({ _id: req.params.id, userId: businessScopeId });
     
     if (!targetTemplate) {
-      return res.status(404).json({ success: false, message: "Template DB mein nahi mila." });
+      return res.status(404).json({ success: false, message: "Template database mein nahi mila." });
     }
 
     if (targetTemplate.mediaUrl) {
@@ -390,21 +394,24 @@ router.delete("/:id", auth, async (req, res) => {
       }
     }
 
-    const userConfig = await WhatsAppConfig.findOne({ userId: businessScopeId });
+    const userCond = getUserQueryCondition(req.user);
+    const userConfig = await WhatsAppConfig.findOne({ $or: userCond }).sort({ updatedAt: -1 });
+
     if (userConfig && userConfig.accessToken && userConfig.businessAccountId) {
       try {
         await axios.delete(`https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?name=${targetTemplate.name}`, {
           headers: { Authorization: `Bearer ${userConfig.accessToken}` }
         });
       } catch (metaErr) {
-        console.warn("⚠️ Meta remove warning:", metaErr.message);
+        console.warn("⚠️ Meta remove warning:", metaErr.response?.data || metaErr.message);
       }
     }
 
     await Template.findByIdAndDelete(req.params.id);
     res.json({ success: true, message: "Template completely deleted!" });
   } catch (err) {
-    res.status(500).json({ success: false, message: "Delete operation fail." });
+    console.error("❌ Delete Route Error:", err.message);
+    res.status(500).json({ success: false, message: "Delete operation failed." });
   }
 });
 
