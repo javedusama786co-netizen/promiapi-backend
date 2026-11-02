@@ -53,11 +53,37 @@ async function resolveAppId(token) {
 // (e.g. a Business Manager id, phone-number id or an id from another business) or the token cannot access it.
 const GRAPH = "https://graph.facebook.com/v20.0";
 
-async function wabaIsReachable(id, token) {
+async function wabaCheck(id, token) {
   try {
-    await axios.get(`${GRAPH}/${id}`, { params: { fields: "id,name" }, headers: { Authorization: `Bearer ${token}` }, timeout: 10000 });
-    return true;
-  } catch (e) { return false; }
+    const r = await axios.get(`${GRAPH}/${id}`, { params: { fields: "id,name" }, headers: { Authorization: `Bearer ${token}` }, timeout: 10000 });
+    return { ok: true, name: r.data?.name || null };
+  } catch (e) {
+    const er = e.response?.data?.error || {};
+    return { ok: false, error: { message: er.message || e.message, code: er.code || null, subcode: er.error_subcode || null } };
+  }
+}
+async function wabaIsReachable(id, token) { return (await wabaCheck(id, token)).ok; }
+
+// What is this token actually? (valid / expired / type / scopes / which WhatsApp accounts it was granted)
+async function inspectToken(token) {
+  try {
+    const appId = await resolveAppId(token);
+    const secret = process.env.FACEBOOK_APP_SECRET;
+    const r = await axios.get(`${GRAPH}/debug_token`, { params: { input_token: token, access_token: secret ? `${appId}|${secret}` : token }, timeout: 10000 });
+    const d = r.data?.data || {};
+    const granular = (d.granular_scopes || []).filter((g) => /^whatsapp_business_/.test(g.scope));
+    return {
+      isValid: d.is_valid !== false,
+      type: d.type || null,
+      appId: d.app_id || null,
+      expiresAt: d.expires_at ? (d.expires_at === 0 ? "never" : new Date(d.expires_at * 1000).toISOString()) : "never",
+      scopes: d.scopes || [],
+      whatsappGranted: granular.map((g) => ({ scope: g.scope, wabaIds: g.target_ids || [] })),
+      error: d.error?.message || null
+    };
+  } catch (e) {
+    return { isValid: null, error: e.response?.data?.error?.message || e.message };
+  }
 }
 
 async function discoverWabaIds(token) {
@@ -94,7 +120,11 @@ async function discoverWabaIds(token) {
 async function ensureValidWaba(cfg) {
   const token = cleanTok(cfg.accessToken);
   const stored = cfg.businessAccountId ? String(cfg.businessAccountId).trim() : "";
-  if (stored && await wabaIsReachable(stored, token)) return { wabaId: stored, token };
+  let storedCheck = { ok: false, error: { message: "no Business Account ID saved" } };
+  if (stored) {
+    storedCheck = await wabaCheck(stored, token);
+    if (storedCheck.ok) return { wabaId: stored, token };
+  }
 
   console.warn(`⚠️ [WABA] Saved Business Account ID "${stored}" is not reachable with this token. Trying to auto-detect the correct one...`);
   const reachable = [];
@@ -119,10 +149,20 @@ async function ensureValidWaba(cfg) {
     return { wabaId: chosen, token };
   }
 
+  const info = await inspectToken(token);
+  const scopeList = (info.scopes || []).join(",") || "unknown";
+  const grantedIds = (info.whatsappGranted || []).flatMap((g) => g.wabaIds);
+  let why = "";
+  if (info.isValid === false || /expired|invalid|session/i.test(storedCheck.error?.message || "")) why = "TOKEN EXPIRED/INVALID - generate a new token. ";
+  else if (info.scopes && info.scopes.length && !info.scopes.includes("whatsapp_business_management")) why = "TOKEN IS MISSING whatsapp_business_management permission. ";
+  else if (grantedIds.length && !grantedIds.includes(stored)) why = `This token only has access to WABA id(s): ${grantedIds.join(", ")} - saved id is different. `;
+  else if (!grantedIds.length) why = "This token has no WhatsApp account assigned (assign the WhatsApp account asset to the System User / token). ";
+
   const err = new Error(
-    `Business Account ID ${stored || "(empty)"} is not accessible with the saved token. ` +
-    `Open Meta Business Settings > WhatsApp accounts, copy the correct "WhatsApp Business Account ID" (NOT the phone number ID / business portfolio ID) ` +
-    `and make sure the token has whatsapp_business_management + whatsapp_business_messaging permissions and access to that account.`
+    `${why}Business Account ID ${stored || "(empty)"} is not accessible with the saved token. ` +
+    `Meta says: "${storedCheck.error?.message}" (code ${storedCheck.error?.code || "-"}). Token scopes: ${scopeList}. ` +
+    `Copy the "WhatsApp Business Account ID" from Meta Business Settings > WhatsApp accounts (NOT phone number ID / business portfolio ID). ` +
+    `Full details: GET /api/templates/diagnose-meta`
   );
   err.wabaProblem = true;
   throw err;
@@ -255,6 +295,55 @@ router.get("/sync-meta", auth, async (req, res) => {
 // =========================================================
 // 2. 🔌 GET ALL TEMPLATES
 // =========================================================
+router.get("/diagnose-meta", auth, async (req, res) => {
+  try {
+    const cfg = await WhatsAppConfig.findOne(getMetaConfigQuery(req.user)).sort({ updatedAt: -1 });
+    if (!cfg || !cfg.accessToken) {
+      return res.json({ success: false, message: "No saved WhatsApp Cloud API config (token + Business Account ID) found for this account." });
+    }
+    const token = cleanTok(cfg.accessToken);
+    const stored = String(cfg.businessAccountId || "").trim();
+    const tokenInfo = await inspectToken(token);
+    const wabaResult = stored ? await wabaCheck(stored, token) : { ok: false, error: { message: "empty" } };
+
+    let phoneResult = null;
+    if (cfg.phoneNumberId) {
+      try {
+        const p = await axios.get(`${GRAPH}/${cfg.phoneNumberId}`, { params: { fields: "id,display_phone_number,verified_name" }, headers: { Authorization: `Bearer ${token}` }, timeout: 10000 });
+        phoneResult = { ok: true, ...p.data };
+      } catch (e) { phoneResult = { ok: false, error: e.response?.data?.error?.message || e.message }; }
+    }
+    const discovered = [];
+    for (const id of await discoverWabaIds(token)) {
+      const c = await wabaCheck(id, token);
+      if (c.ok) discovered.push({ id, name: c.name });
+    }
+
+    const hints = [];
+    if (tokenInfo.isValid === false) hints.push("Token is expired/invalid: create a new (System User, never-expiring) token.");
+    if (tokenInfo.type && /PAGE/i.test(tokenInfo.type)) hints.push("This is a PAGE token - WhatsApp needs a User/System User token.");
+    if (tokenInfo.scopes && tokenInfo.scopes.length && !tokenInfo.scopes.includes("whatsapp_business_management")) hints.push("Missing permission whatsapp_business_management (needed to read/create templates).");
+    if (tokenInfo.scopes && tokenInfo.scopes.length && !tokenInfo.scopes.includes("whatsapp_business_messaging")) hints.push("Missing permission whatsapp_business_messaging.");
+    if (stored && stored === String(cfg.phoneNumberId || "")) hints.push("Saved Business Account ID equals the Phone Number ID - you saved the wrong id.");
+    if (!wabaResult.ok && discovered.length) hints.push(`Use one of these working WABA ids instead: ${discovered.map((d) => d.id).join(", ")}`);
+    if (!wabaResult.ok && !discovered.length && phoneResult?.ok) hints.push("Token can use the phone number but cannot see the WABA: in Business Settings > System Users, assign the WhatsApp account asset (Full control) to this token's user, then regenerate the token.");
+    if (!wabaResult.ok && !discovered.length && !phoneResult?.ok) hints.push("Token cannot access either the WABA or the phone number: it belongs to a different business / app, or has no WhatsApp asset assigned.");
+    if (wabaResult.ok) hints.push("Business Account ID is fine - Sync should work now.");
+
+    return res.json({
+      success: true,
+      saved: { businessAccountId: stored || null, phoneNumberId: cfg.phoneNumberId || null, platform: cfg.platform, configId: cfg._id },
+      token: tokenInfo,
+      wabaCheck: wabaResult,
+      phoneCheck: phoneResult,
+      workingWabaIds: discovered,
+      hints
+    });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: err.message });
+  }
+});
+
 router.get("/", auth, async (req, res) => {
   try {
     const businessScopeId = req.user.adminId || req.user.id;
