@@ -1342,7 +1342,8 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   const waRules = "\n\nIMPORTANT RULES (WhatsApp channel):\n1. Answer ONLY what the customer asked in their latest message. Do NOT add extra details, other services, features or integrations they did not ask about.\n2. Never write one big paragraph. Use short lines separated by blank lines. For how-to questions use a numbered list (maximum 6 steps, one short line each). For other questions use 2-4 short sentences. Stay under 900 characters.\n3. If the question is broad (for example 'tell me your services' or 'details'), give a ONE-line overview and ask which specific thing they want to know more about.\n4. Do not repeat information that was already given earlier in the chat.\n5. Plain text only: no markdown tables, no # headings. Use *single asterisks* for bold, and '1.' or '-' for lists.\n6. Reply in the same language and script the customer writes in.\n7. Tone: polite, professional and friendly. Use at most one emoji. End with one short line offering further help.";
   const messages = [{ role: "system", content: systemPrompt + waRules }];
 
-  const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ createdAt: -1 }).limit(12).lean();
+  // NOTE: ChatMessage schema has NO createdAt field (only `timestamp`). Sorting by createdAt returned the OLDEST messages, so the AI "forgot" the recent chat.
+  const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ timestamp: -1, _id: -1 }).limit(12).lean();
   const history = chatHistory.reverse()
     .map((m) => ({ role: m.sender === "me" ? "assistant" : "user", content: typeof m.text === "string" ? m.text.trim() : "" }))
     .filter((m) => m.content); // Groq rejects empty message content (media-only messages have no text)
@@ -1743,6 +1744,27 @@ async function sendWhatsAppReadReceipt(phoneNumberId, accessToken, messageId, sh
     }
     return false;
   }
+}
+
+// =========================================================================
+// ⏱ HUMAN-LIKE REPLY DELAY (dashboard: "Simulated Typing Delay", seconds)
+// The customer sees "typing..." while we wait. Delay counts from the moment the message arrived,
+// so it is a MINIMUM wait: if the AI already took 3s and delay is 2s, we send immediately.
+// =========================================================================
+async function waitReplyDelay(settings, startedAt) {
+  const sec = Number(settings?.advanced?.responseDelay) || 0;
+  if (sec <= 0) return;
+  const remaining = sec * 1000 - (Date.now() - (startedAt || Date.now()));
+  if (remaining > 0) {
+    console.log(`⏱ [REPLY DELAY] waiting ${(remaining / 1000).toFixed(1)}s (setting=${sec}s)`);
+    await new Promise((resolve) => setTimeout(resolve, remaining));
+  }
+}
+
+// Same as sendUniversalWhatsAppMessage, but waits for the configured delay first (use ONLY for bot / auto replies)
+async function sendBotWhatsApp(settings, startedAt, ...sendArgs) {
+  await waitReplyDelay(settings, startedAt);
+  return sendUniversalWhatsAppMessage(...sendArgs);
 }
 
 async function isDuplicateInbound(rawId) {
@@ -2387,6 +2409,7 @@ router.post("/", async (req, res) => {
               const activeFlows = await BotFlow.find({ userId: targetUserId, isActive: true });
               console.log(`🤖 [BOT] input="${cleanKeyword}" buttonId="${buttonPayloadId}" session=${userSession.currentStep} activeFlows=${activeFlows.length}`);
 
+              const botStartedAt = Date.now(); // used by the reply-delay setting
               // 👀 Blue ticks + "typing..." (typing only when a bot reply is likely, as Meta recommends)
               {
                 const botMayReply = activeFlows.length > 0 || settings?.openai?.enabled === true || settings?.groq?.enabled === true || settings?.flowise?.enabled === true;
@@ -2559,16 +2582,16 @@ if (targetNode) {
 
                   if (flowPayload && Object.keys(flowPayload).length > 0) {
                     const plainFallbackText = nodeText || nodeData.message || nodeData.text;
-                    let metaResponse = await sendUniversalWhatsAppMessage(targetUserId, metaPhoneNumberId, accessToken, customerPhone, flowPayload, plainFallbackText);
+                    let metaResponse = await sendBotWhatsApp(settings, botStartedAt, targetUserId, metaPhoneNumberId, accessToken, customerPhone, flowPayload, plainFallbackText);
 
                     if (!metaResponse && fallbackPayload) {
                       console.warn("⚠️ [FLOW NODE] Media rejected by Meta - sending the reply without media.");
-                      metaResponse = await sendUniversalWhatsAppMessage(targetUserId, metaPhoneNumberId, accessToken, customerPhone, fallbackPayload, plainFallbackText);
+                      metaResponse = await sendBotWhatsApp(settings, botStartedAt, targetUserId, metaPhoneNumberId, accessToken, customerPhone, fallbackPayload, plainFallbackText);
                     }
 
                     // media-only audio has no caption: send the text as a follow-up
                     if (metaResponse && nodeMedia?.kind === "audio" && !hasButtons && nodeText) {
-                      await sendUniversalWhatsAppMessage(targetUserId, metaPhoneNumberId, accessToken, customerPhone, { type: "text", text: { body: nodeText } }, nodeText);
+                      await sendBotWhatsApp(settings, botStartedAt, targetUserId, metaPhoneNumberId, accessToken, customerPhone, { type: "text", text: { body: nodeText } }, nodeText);
                     }
 
                     if (metaResponse) {
@@ -2752,11 +2775,11 @@ if (targetNode) {
                   }
 
                   if (botPayload && Object.keys(botPayload).length > 0) {
-                    let metaResponse = await sendUniversalWhatsAppMessage(targetUserId, metaPhoneNumberId, accessToken, customerPhone, botPayload, matchedRule.replyText);
+                    let metaResponse = await sendBotWhatsApp(settings, botStartedAt, targetUserId, metaPhoneNumberId, accessToken, customerPhone, botPayload, matchedRule.replyText);
 
                     if (!metaResponse && botPayload.type === "template" && templateFallbackPayload) {
                       botPayload = templateFallbackPayload;
-                      metaResponse = await sendUniversalWhatsAppMessage(targetUserId, metaPhoneNumberId, accessToken, customerPhone, botPayload, matchedRule.replyText);
+                      metaResponse = await sendBotWhatsApp(settings, botStartedAt, targetUserId, metaPhoneNumberId, accessToken, customerPhone, botPayload, matchedRule.replyText);
                     }
                     
                     if (metaResponse) {
@@ -2810,7 +2833,7 @@ if (targetNode) {
                     text: { body: replyText }
                   };
 
-                  const metaResponse = await sendUniversalWhatsAppMessage(targetUserId, metaPhoneNumberId, accessToken, customerPhone, replyPayload, replyText);
+                  const metaResponse = await sendBotWhatsApp(settings, botStartedAt, targetUserId, metaPhoneNumberId, accessToken, customerPhone, replyPayload, replyText);
 
                   if (metaResponse) {
                     const rawWamid = metaResponse.messages?.[0]?.id;
