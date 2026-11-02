@@ -1713,6 +1713,38 @@ async function processWooCommerceNotification(wooData, userId = null) {
 // 🛡 DUPLICATE WEBHOOK GUARD  (Meta retries the same event when we answer slowly / with 5xx)
 // =========================================================================
 const recentInboundIds = new Map();
+// =========================================================================
+// 👀 BLUE TICKS + "typing..." INDICATOR (WhatsApp Cloud API)
+// Marks the customer's message as read (two blue ticks). With showTyping=true it also shows "typing..."
+// on the customer's phone until we send a reply (or 25 seconds pass, whichever is first).
+// =========================================================================
+const META_GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v24.0";
+async function sendWhatsAppReadReceipt(phoneNumberId, accessToken, messageId, showTyping = false) {
+  if (!phoneNumberId || !accessToken || !messageId) return false;
+  const url = `https://graph.facebook.com/${META_GRAPH_VERSION}/${phoneNumberId}/messages`;
+  const headers = { Authorization: `Bearer ${accessToken}`, "Content-Type": "application/json" };
+  const base = { messaging_product: "whatsapp", status: "read", message_id: String(messageId).trim() };
+
+  try {
+    await axios.post(url, showTyping ? { ...base, typing_indicator: { type: "text" } } : base, { headers, timeout: 8000 });
+    console.log(`👀 [WA READ] marked read${showTyping ? " + typing" : ""} | ${base.message_id.slice(-10)}`);
+    return true;
+  } catch (err) {
+    console.warn(`⚠️ [WA READ] failed${showTyping ? " (with typing)" : ""}:`, JSON.stringify(err.response?.data?.error || err.message));
+    // If the typing part was rejected, still give the customer their blue ticks
+    if (showTyping) {
+      try {
+        await axios.post(url, base, { headers, timeout: 8000 });
+        console.log("👀 [WA READ] marked read (without typing)");
+        return true;
+      } catch (e2) {
+        console.warn("⚠️ [WA READ] retry without typing failed:", JSON.stringify(e2.response?.data?.error || e2.message));
+      }
+    }
+    return false;
+  }
+}
+
 async function isDuplicateInbound(rawId) {
   if (!rawId) return false;
   const key = String(rawId).trim();
@@ -2306,6 +2338,11 @@ router.post("/", async (req, res) => {
             const savedIncomingLog = await incomingChatLog.save();
             emitNewMessageNotification(req, savedIncomingLog, currentUnread);
 
+            // Media-only message (no text/button): bot logic below is skipped, so just give blue ticks here
+            if (!(cleanKeyword || cleanButtonId)) {
+              sendWhatsAppReadReceipt(metaPhoneNumberId, accessToken, messageData.id, false);
+            }
+
             if (isCoolingDown) {
               return res.status(200).send("EVENT_RECEIVED");
             }
@@ -2349,6 +2386,12 @@ router.post("/", async (req, res) => {
 
               const activeFlows = await BotFlow.find({ userId: targetUserId, isActive: true });
               console.log(`🤖 [BOT] input="${cleanKeyword}" buttonId="${buttonPayloadId}" session=${userSession.currentStep} activeFlows=${activeFlows.length}`);
+
+              // 👀 Blue ticks + "typing..." (typing only when a bot reply is likely, as Meta recommends)
+              {
+                const botMayReply = activeFlows.length > 0 || settings?.openai?.enabled === true || settings?.groq?.enabled === true || settings?.flowise?.enabled === true;
+                sendWhatsAppReadReceipt(metaPhoneNumberId, accessToken, messageData.id, botMayReply);
+              }
 
               for (const flow of activeFlows) {
                 if (!flow.nodes || flow.nodes.length === 0) continue;
