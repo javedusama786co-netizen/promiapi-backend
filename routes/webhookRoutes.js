@@ -1114,6 +1114,10 @@ async function verifyUserAiSubscription(userId) {
   try {
     const settings = await AiBotSettings.findOne({ userId }).lean();
     if (settings) {
+      // ✅ No separate AI subscription in this system: the user just saves an API key and turns the AI toggle ON.
+      if (settings.openai?.enabled === true || settings.groq?.enabled === true) {
+        return true;
+      }
       if (settings.isAiSubscribed === true || settings.subscriptionActive === true || settings.isSubscribed === true) {
         return true;
       }
@@ -1136,7 +1140,7 @@ async function verifyUserAiSubscription(userId) {
   } catch (err) {
     console.error("⚠️ Subscription Verification Error:", err?.message);
   }
-  console.log(`⛔ [AI SUBSCRIPTION] user=${userId} has no active AI subscription flag (isAiSubscribed / subscriptionActive / isSubscribed / subscriptionStatus=active / planType=ai / plan=pro / aiEnabled) in AiBotSettings or User.`);
+  console.log(`⛔ [AI SKIP] AI toggle is OFF (or no AiBotSettings saved) for user=${userId} - turn the AI toggle ON in the dashboard and save the API key.`);
   return false;
 }
 

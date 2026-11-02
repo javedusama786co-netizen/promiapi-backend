@@ -9,11 +9,6 @@ const AiBotSettingsSchema = new mongoose.Schema(
       unique: true,
     },
 
-    // 💳 AI subscription flag.
-    // webhookRoutes.js -> verifyUserAiSubscription() checks this field first.
-    // It was missing from the schema earlier, so Mongoose (strict mode) silently dropped it on save.
-    isAiSubscribed: { type: Boolean, default: false },
-
     general: {
       failedMessage: { type: String, default: "" },
       enableForNewContacts: { type: Boolean, default: false },
