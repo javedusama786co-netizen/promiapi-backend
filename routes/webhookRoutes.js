@@ -1370,9 +1370,9 @@ async function processAiBotResponse(userId, customerPhone, userText) {
         ];
 
         const openAiRes = await axios.post(
-          "https://api.openai.com/v1/chat/completions",
+          "https://api.groq.com/openai/v1/chat/completions", // ✅ Groq Base URL
           {
-            model: settings.openai.model || "gpt-4o",
+            model: "llama3-70b-8192", // ✅ Groq ka fast aur powerful model
             messages,
             tools,
             tool_choice: "auto",
@@ -1380,7 +1380,7 @@ async function processAiBotResponse(userId, customerPhone, userText) {
           },
           {
             headers: {
-              Authorization: `Bearer ${settings.openai.apiKey}`,
+              Authorization: `Bearer ${settings.openai.apiKey}`, // Yahan aap dashboard mein Groq ki key save karenge
               "Content-Type": "application/json",
               "Accept-Encoding": "gzip, deflate, br"
             },
@@ -1406,9 +1406,9 @@ async function processAiBotResponse(userId, customerPhone, userText) {
           });
 
           const secondAiRes = await axios.post(
-            "https://api.openai.com/v1/chat/completions",
+            "https://api.groq.com/openai/v1/chat/completions", // ✅ Groq URL
             {
-              model: settings.openai.model || "gpt-4o",
+              model: "llama3-70b-8192", // ✅ Groq Model
               messages,
               temperature: settings.openai.temperature ?? 0.7
             },
