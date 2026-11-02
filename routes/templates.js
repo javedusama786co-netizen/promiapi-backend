@@ -48,6 +48,86 @@ async function resolveAppId(token) {
   return "1543305467331355"; // same default used in whatsappConfig.js
 }
 
+// 🔎 WABA (WhatsApp Business Account) ID validation + auto-repair.
+// "Object with ID ... does not exist / missing permissions" means the saved businessAccountId is wrong
+// (e.g. a Business Manager id, phone-number id or an id from another business) or the token cannot access it.
+const GRAPH = "https://graph.facebook.com/v20.0";
+
+async function wabaIsReachable(id, token) {
+  try {
+    await axios.get(`${GRAPH}/${id}`, { params: { fields: "id,name" }, headers: { Authorization: `Bearer ${token}` }, timeout: 10000 });
+    return true;
+  } catch (e) { return false; }
+}
+
+async function discoverWabaIds(token) {
+  const ids = new Set();
+  const headers = { Authorization: `Bearer ${token}` };
+
+  // 1) Ask Meta which WhatsApp accounts this token was granted (most reliable)
+  try {
+    const appId = await resolveAppId(token);
+    const secret = process.env.FACEBOOK_APP_SECRET;
+    const r = await axios.get(`${GRAPH}/debug_token`, { params: { input_token: token, access_token: secret ? `${appId}|${secret}` : token } });
+    (r.data?.data?.granular_scopes || []).forEach((gs) => {
+      if (/^whatsapp_business_(management|messaging)$/.test(gs.scope)) (gs.target_ids || []).forEach((i) => ids.add(String(i)));
+    });
+  } catch (e) { /* ignore */ }
+
+  // 2) Walk the user's businesses
+  try {
+    const b = await axios.get(`${GRAPH}/me/businesses`, { headers, params: { fields: "id,name", limit: 25 } });
+    for (const biz of b.data?.data || []) {
+      for (const edge of ["owned_whatsapp_business_accounts", "client_whatsapp_business_accounts"]) {
+        try {
+          const r = await axios.get(`${GRAPH}/${biz.id}/${edge}`, { headers, params: { fields: "id", limit: 50 } });
+          (r.data?.data || []).forEach((x) => ids.add(String(x.id)));
+        } catch (e) { /* ignore */ }
+      }
+    }
+  } catch (e) { /* ignore */ }
+
+  return [...ids];
+}
+
+// Returns { wabaId, token }. Repairs the stored id in the DB when a working one is found; throws a clear Error otherwise.
+async function ensureValidWaba(cfg) {
+  const token = cleanTok(cfg.accessToken);
+  const stored = cfg.businessAccountId ? String(cfg.businessAccountId).trim() : "";
+  if (stored && await wabaIsReachable(stored, token)) return { wabaId: stored, token };
+
+  console.warn(`⚠️ [WABA] Saved Business Account ID "${stored}" is not reachable with this token. Trying to auto-detect the correct one...`);
+  const reachable = [];
+  for (const id of await discoverWabaIds(token)) {
+    if (id !== stored && await wabaIsReachable(id, token)) reachable.push(id);
+  }
+
+  let chosen = null;
+  if (cfg.phoneNumberId) {
+    for (const id of reachable) {
+      try {
+        const p = await axios.get(`${GRAPH}/${id}/phone_numbers`, { headers: { Authorization: `Bearer ${token}` }, params: { fields: "id" } });
+        if ((p.data?.data || []).some((x) => String(x.id) === String(cfg.phoneNumberId))) { chosen = id; break; }
+      } catch (e) { /* ignore */ }
+    }
+  }
+  if (!chosen && reachable.length > 0) chosen = reachable[0];
+
+  if (chosen) {
+    console.log(`✅ [WABA] Corrected Business Account ID: ${stored || "(empty)"} -> ${chosen}`);
+    try { await WhatsAppConfig.updateOne({ _id: cfg._id }, { $set: { businessAccountId: chosen } }); } catch (e) { /* ignore */ }
+    return { wabaId: chosen, token };
+  }
+
+  const err = new Error(
+    `Business Account ID ${stored || "(empty)"} is not accessible with the saved token. ` +
+    `Open Meta Business Settings > WhatsApp accounts, copy the correct "WhatsApp Business Account ID" (NOT the phone number ID / business portfolio ID) ` +
+    `and make sure the token has whatsapp_business_management + whatsapp_business_messaging permissions and access to that account.`
+  );
+  err.wabaProblem = true;
+  throw err;
+}
+
 // Helper function for robust user query filter (Strictly targeting Official WhatsApp & Meta Config)
 const getMetaConfigQuery = (user) => {
   const businessScopeId = user.adminId || user.id || user._id;
@@ -84,9 +164,14 @@ router.get("/sync-meta", auth, async (req, res) => {
       });
     }
 
-    const syncToken = cleanTok(userConfig.accessToken);
+    let syncToken, syncWabaId;
+    try {
+      ({ wabaId: syncWabaId, token: syncToken } = await ensureValidWaba(userConfig));
+    } catch (wErr) {
+      return res.status(400).json({ success: false, message: wErr.message });
+    }
     let metaTemplates = [];
-    let nextUrl = `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?limit=100`;
+    let nextUrl = `https://graph.facebook.com/v20.0/${syncWabaId}/message_templates?limit=100`;
     for (let page = 0; nextUrl && page < 20; page++) {
       const response = await axios.get(nextUrl, { headers: { Authorization: `Bearer ${syncToken}` } });
       metaTemplates = metaTemplates.concat(response.data?.data || []);
@@ -229,7 +314,13 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
     let headerUploadFailed = false;
     let headerUploadError = "";
 
+    let metaWabaId = null;
     if (userConfig && userConfig.accessToken && userConfig.businessAccountId) {
+      try { metaWabaId = (await ensureValidWaba(userConfig)).wabaId; }
+      catch (wErr) { metaNotice = `Saved locally! ${wErr.message}`; }
+    }
+
+    if (metaWabaId) {
       const metaComponents = [];
 
       if (headerType === "text" && headerText) {
@@ -343,7 +434,7 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
         metaNotice = `Saved locally! Meta media upload failed: ${headerUploadError || "unknown error"}`;
       } else try {
         const metaRes = await axios.post(
-          `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates`, 
+          `https://graph.facebook.com/v20.0/${metaWabaId}/message_templates`, 
           metaPayload, 
           { headers: { Authorization: `Bearer ${cleanTok(userConfig.accessToken)}`, "Content-Type": "application/json" } }
         );
@@ -398,7 +489,8 @@ router.delete("/:id", auth, async (req, res) => {
 
     if (userConfig && userConfig.accessToken && userConfig.businessAccountId) {
       try {
-        await axios.delete(`https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?name=${encodeURIComponent(targetTemplate.name)}`, {
+        const { wabaId: delWabaId } = await ensureValidWaba(userConfig);
+        await axios.delete(`https://graph.facebook.com/v20.0/${delWabaId}/message_templates?name=${encodeURIComponent(targetTemplate.name)}`, {
           headers: { Authorization: `Bearer ${cleanTok(userConfig.accessToken)}` }
         });
       } catch (metaErr) {
