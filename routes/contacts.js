@@ -127,9 +127,16 @@ async function checkWhatsAppStatus(phone, userId) {
 
     // 2. Check via Official Meta Cloud API if configured
     let configRecord = null;
-    if (WhatsAppConfig) {
-      configRecord = await WhatsAppConfig.findOne({ userId: userId, platform: { $in: ["whatsapp", "whatsapp_official"] } });
-    }
+if (WhatsAppConfig) {
+  const isObjectId = mongoose.Types.ObjectId.isValid(userId);
+  const userCond = [{ userId: userId }, { userId: String(userId) }];
+  if (isObjectId) userCond.push({ userId: new mongoose.Types.ObjectId(userId) });
+  
+  configRecord = await WhatsAppConfig.findOne({ 
+    $or: userCond, 
+    platform: { $in: ["whatsapp", "whatsapp_official", "whatsapp_qr"] } 
+  }).sort({ updatedAt: -1 });
+}
 
     if (configRecord && configRecord.phoneNumberId && configRecord.accessToken) {
       const { phoneNumberId, accessToken } = configRecord;
