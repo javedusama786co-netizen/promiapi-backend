@@ -140,7 +140,19 @@ async function getActiveMetaCredentials(userId = null, platform = "whatsapp") {
       }
 
       if (WhatsAppConfig) {
-        config = await WhatsAppConfig.findOne({ $or: userConditions, platform }).sort({ updatedAt: -1 }).lean();
+        // The dashboard saves Cloud-API settings as "whatsapp_official" (older records are "whatsapp").
+        // Looking only for platform==="whatsapp" picked the OLD record (old token) even after a new token was saved.
+        const isWa = platform === "whatsapp" || platform === "whatsapp_official";
+        if (isWa) {
+          const waPlatforms = ["whatsapp_official", "whatsapp"];
+          config = await WhatsAppConfig.findOne({
+            $or: userConditions, platform: { $in: waPlatforms },
+            accessToken: { $nin: [null, ""] }, phoneNumberId: { $nin: [null, ""] }
+          }).sort({ updatedAt: -1 }).lean();
+          if (!config) config = await WhatsAppConfig.findOne({ $or: userConditions, platform: { $in: waPlatforms } }).sort({ updatedAt: -1 }).lean();
+        } else {
+          config = await WhatsAppConfig.findOne({ $or: userConditions, platform }).sort({ updatedAt: -1 }).lean();
+        }
         if (!config) {
           config = await WhatsAppConfig.findOne({ $or: userConditions }).sort({ updatedAt: -1 }).lean();
         }
@@ -173,7 +185,7 @@ async function getActiveMetaCredentials(userId = null, platform = "whatsapp") {
 
     if (config) {
       const rawToken = config.pageAccessToken || config.accessToken || "";
-      credentials.accessToken = String(rawToken).replace(/^["']|["']$/g, "").trim() || null;
+      credentials.accessToken = String(rawToken).replace(/^["']|["']$/g, "").trim().replace(/[\r\n]+/g, "") || null;
       credentials.appSecret = config.appSecret || config.facebookAppSecret || null;
       credentials.phoneNumberId = config.phoneNumberId || null;
       credentials.pageId = config.pageId || null;
@@ -181,7 +193,7 @@ async function getActiveMetaCredentials(userId = null, platform = "whatsapp") {
       credentials.userId = config.userId || null;
 
       if (credentials.accessToken) {
-        console.log(`🔑 [DB CREDENTIALS RESOLVED] Platform: ${platform} | User: ${credentials.userId || "Global"}`);
+        console.log(`🔑 [DB CREDENTIALS RESOLVED] Platform: ${platform} | User: ${credentials.userId || "Global"} | usedConfig=${config.platform}/${config._id} | phoneNumberId=${config.phoneNumberId || "-"} | token=...${credentials.accessToken.slice(-6)} | updated=${config.updatedAt ? new Date(config.updatedAt).toISOString() : "-"}`);
         return credentials;
       }
     }
@@ -251,10 +263,27 @@ async function sendQrWhatsAppMessage(userId, to, messageText) {
   }
 }
 
+// Turns a Meta send failure into a message the dashboard user can act on
+function describeMetaSendError(err) {
+  const e = err?.response?.data?.error || {};
+  const code = e.code || null;
+  const sub = e.error_subcode || null;
+  const msg = e.error_data?.details || e.message || err?.message || "Unknown error";
+  let hint = msg;
+  if (code === 190 || /access token|session has expired|OAuthException/i.test(msg) && code !== 100) hint = "Access token expire/invalid hai (temporary token 24 ghante mein expire hota hai). Naya System User token Settings mein save karein.";
+  else if (code === 131030) hint = "Ye number Meta ki 'allowed recipients' list mein nahi (test number sirf verified numbers ko bhej sakta hai).";
+  else if (code === 131047) hint = "Customer ke last message ko 24 ghante se zyada ho gaye - ab sirf approved Template bhej sakte hain.";
+  else if (code === 131026) hint = "Message deliver nahi ho sakta (number WhatsApp par nahi hai ya customer ne accept nahi kiya).";
+  else if (code === 100 && /phone|object with ID|does not exist/i.test(msg)) hint = "Phone Number ID is token ke account se match nahi karti - Settings mein sahi Phone Number ID + us ke account ka token save karein.";
+  else if (code === 10 || code === 200 || code === 3) hint = "Token ke paas whatsapp_business_messaging permission / WhatsApp account ka access nahi.";
+  else if (code === 131056 || code === 130429) hint = "Meta rate limit - thori der baad dobara try karein.";
+  return { hint: `${hint} (Meta code ${code || "-"}${sub ? "/" + sub : ""})`, meta: { message: msg, code, subcode: sub } };
+}
+
 // 🟢 Helper function to send Meta WhatsApp message
-async function sendMetaWhatsAppMessage(phoneNumberId, accessToken, to, metaPayload) {
+async function sendMetaWhatsAppMessage(phoneNumberId, accessToken, to, metaPayload, errOut = null) {
   try {
-    const cleanToken = accessToken ? accessToken.replace(/^["']|["']$/g, "").trim() : "";
+    const cleanToken = accessToken ? accessToken.replace(/^["']|["']$/g, "").trim().replace(/[\r\n]+/g, "") : "";
     const metaUrl = `https://graph.facebook.com/v20.0/${phoneNumberId}/messages`;
     console.log(`📡 [META TRANSMISSION - WHATSAPP] Target Phone: ${to}`);
     const response = await axios.post(metaUrl, {
@@ -273,19 +302,20 @@ async function sendMetaWhatsAppMessage(phoneNumberId, accessToken, to, metaPaylo
     return response.data;
   } catch (err) {
     console.error("❌ Meta WhatsApp transmission API failed:", err.response?.data || err.message);
+    if (errOut) Object.assign(errOut, describeMetaSendError(err));
     return null;
   }
 }
 
 // ⚡ UNIVERSAL SENDER (AUTOMATICALLY SWITCHES BETWEEN QR AND OFFICIAL META)
-async function sendUniversalWhatsAppMessage(userId, phoneNumberId, accessToken, to, metaPayload, messageText) {
+async function sendUniversalWhatsAppMessage(userId, phoneNumberId, accessToken, to, metaPayload, messageText, errOut = null) {
   const channelInfo = await getActiveWhatsAppChannel(userId);
 
   if (channelInfo.platformType === "QR") {
     const plainText = messageText || metaPayload?.text?.body || "Media Message";
     return await sendQrWhatsAppMessage(userId, to, plainText);
   } else {
-    return await sendMetaWhatsAppMessage(phoneNumberId, accessToken, to, metaPayload);
+    return await sendMetaWhatsAppMessage(phoneNumberId, accessToken, to, metaPayload, errOut);
   }
 }
 
@@ -3273,6 +3303,13 @@ router.post("/send", upload.single("file"), async (req, res) => {
     // Official Meta Cloud API Dispatch
     const { accessToken, phoneNumberId, userId: targetUserId } = await getActiveMetaCredentials(userId, "whatsapp");
 
+    if (!accessToken || !phoneNumberId) {
+      return res.status(400).json({
+        success: false,
+        error: `WhatsApp Cloud API ${!accessToken ? "Access Token" : "Phone Number ID"} save nahi hai. Settings mein dobara token + Phone Number ID save karein.`
+      });
+    }
+
     let metaPayload = {
       messaging_product: "whatsapp",
       recipient_type: "individual",
@@ -3321,7 +3358,8 @@ router.post("/send", upload.single("file"), async (req, res) => {
     }
 
     const cleanRecipient = formatToInternationalPhone(to);
-    const metaResponse = await sendUniversalWhatsAppMessage(targetUserId, phoneNumberId, accessToken, cleanRecipient, metaPayload, outputText);
+    const sendErr = {};
+    const metaResponse = await sendUniversalWhatsAppMessage(targetUserId, phoneNumberId, accessToken, cleanRecipient, metaPayload, outputText, sendErr);
 
     if (metaResponse) {
       const rawOutboundId = metaResponse.messages?.[0]?.id || `outbound-${Date.now()}`;
@@ -3353,7 +3391,7 @@ router.post("/send", upload.single("file"), async (req, res) => {
       });
     }
 
-    return res.status(400).json({ success: false, error: "Transmission pipeline failed." });
+    return res.status(400).json({ success: false, error: sendErr.hint || "Transmission pipeline failed.", metaError: sendErr.meta || null });
 
   } catch (err) {
     console.error("❌ OUTBOUND TRANSMISSION CORE ERROR:", err.message);
