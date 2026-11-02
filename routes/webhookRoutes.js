@@ -644,7 +644,9 @@ function findLocalUploadFile(link) {
       path.join(process.cwd(), "uploads", rel),
       path.join(__dirname, "..", "uploads", rel),
       path.join(__dirname, "uploads", rel),
-      path.join(process.cwd(), "uploads", path.basename(pathname))
+      path.join(process.cwd(), "uploads", path.basename(pathname)),
+      path.join(process.cwd(), "uploads", "templates", path.basename(pathname)),
+      path.join(__dirname, "..", "uploads", "templates", path.basename(pathname))
     ];
     for (const full of candidates) {
       if (fs.existsSync(full)) return full;
@@ -1722,8 +1724,10 @@ function pickFlowNodeMedia(node) {
   const d = node?.data || {};
   const strongKeys = ["mediaUrl", "media_url", "media", "mediaLink", "imageUrl", "image_url", "image", "imageLink",
     "videoUrl", "video_url", "video", "documentUrl", "document_url", "document", "fileUrl", "file_url", "file",
-    "audioUrl", "audio_url", "audio", "attachment", "attachmentUrl", "headerMedia", "headerImage", "photo", "picture"];
-  const weakKeys = ["url", "link", "src", "header"];
+    "audioUrl", "audio_url", "audio", "attachment", "attachmentUrl", "headerMedia", "headerImage", "photo", "picture",
+    "mediaPath", "media_path", "filePath", "file_path", "mediaFile", "media_file", "fileName", "filename", "mediaName",
+    "replyMedia", "replyImage", "attachments", "files", "medias", "mediaList"];
+  const weakKeys = ["url", "link", "src", "header", "path"];
 
   const readUrl = (v) => {
     if (Array.isArray(v)) return readUrl(v[0]);
@@ -1731,7 +1735,8 @@ function pickFlowNodeMedia(node) {
     if (v && typeof v === "object") return String(v.url || v.link || v.src || v.mediaUrl || v.path || "").trim();
     return "";
   };
-  const looksLikeFile = (u) => /^https?:\/\//i.test(u) || u.startsWith("/") || /^uploads\//i.test(u);
+  const looksLikeFile = (u) => /^https?:\/\//i.test(u) || u.startsWith("/") || /^uploads\//i.test(u) ||
+    (FLOW_MEDIA_EXT.test(u.split("?")[0]) && !/^(blob:|data:)/i.test(u) && Boolean(findLocalUploadFile(u)));
 
   let url = "";
   let key = "";
@@ -1754,6 +1759,10 @@ function pickFlowNodeMedia(node) {
     if (deep?.url) { url = deep.url; key = "deep"; }
   }
   if (!url) return null;
+  // bare file name saved by the builder (e.g. "user-1-123.jpg") -> public /uploads path
+  if (!/^https?:\/\//i.test(url) && !url.startsWith("/") && !/^uploads\//i.test(url)) {
+    url = `/uploads/${path.basename(url.split("?")[0])}`;
+  }
 
   const ext = path.extname(url.split("?")[0]).toLowerCase();
   let kind = null;
@@ -1774,11 +1783,69 @@ function pickFlowNodeMedia(node) {
   return { url, kind, filename: d.fileName || d.filename || rawObj.filename || null };
 }
 
+// A flow reply node can point to a saved Template instead of carrying its own text/media.
+// Returns the template reference (name / title / _id) or "".
+function pickFlowNodeTemplateRef(nodeData) {
+  const d = nodeData || {};
+  const looksTemplateNode = /template/i.test(String(d.botType || d.replyType || d.messageType || d.nodeType || ""));
+  const candidates = [d.templateName, d.templateId, d.template_id, d.template_name, d.selectedTemplate, d.template];
+  if (looksTemplateNode) candidates.push(d.name, d.title);
+  for (const c of candidates) {
+    if (typeof c === "string" && c.trim()) return c.trim();
+    if (c && typeof c === "object") {
+      const v = c.name || c.title || c._id || c.id;
+      if (v) return String(v).trim();
+    }
+  }
+  return "";
+}
+
+async function findTemplateForFlow(userId, ref) {
+  if (!ref) return null;
+  try {
+    const or = [{ name: ref }, { title: ref }];
+    if (mongoose.Types.ObjectId.isValid(ref)) or.push({ _id: ref });
+    return await Template.findOne({ userId, $or: or }).lean();
+  } catch (e) { return null; }
+}
+
 // =========================================================================
 // 🔘 VISUAL FLOW BUTTON ROUTING  (answer ONLY for the button that was clicked)
 // Outgoing flow buttons carry the id  "<nodeId>::<buttonId>"  so a click can be traced
 // to the exact node + button that was sent (no collisions between btn_0 of different nodes).
 // =========================================================================
+function flowNodeHasContent(node) {
+  const d = node?.data || {};
+  return Boolean(pickFlowNodeText(d) || pickFlowNodeMedia(node) || pickFlowNodeTemplateRef(d) || (Array.isArray(d.buttons) && d.buttons.length > 0));
+}
+
+// A button target that carries nothing (pure routing / spacer node) -> follow its outgoing edge to the real reply (max 5 hops)
+function skipEmptyFlowNodes(flow, node) {
+  let cur = node;
+  for (let hop = 0; cur && hop < 5 && !flowNodeHasContent(cur); hop++) {
+    const edge = (flow.edges || []).find((e) => e.source === cur.id);
+    const next = edge ? (flow.nodes || []).find((n) => n.id === edge.target) : null;
+    if (!next) break;
+    console.log(`↪️ [FLOW] node ${cur.id} is empty - following edge to ${next.id}`);
+    cur = next;
+  }
+  return cur;
+}
+
+// Some builders keep the reply (text / media / template) INSIDE the button object instead of a connected node.
+function buttonReplyAsNode(btn, nodeId) {
+  if (!btn || typeof btn !== "object") return null;
+  const inner = [btn.reply, btn.response, btn.replyData, btn.content].find((v) => v && typeof v === "object" && !Array.isArray(v)) || {};
+  const textStr = [btn.replyText, btn.reply_text, btn.responseText, btn.response, btn.reply, btn.answer].find((v) => typeof v === "string" && v.trim());
+  const data = { ...inner };
+  if (textStr && !data.message) data.message = textStr.trim();
+  const copyKeys = ["mediaUrl", "media_url", "media", "imageUrl", "image", "videoUrl", "video", "documentUrl", "document", "fileUrl", "file",
+    "audioUrl", "audio", "attachment", "replyMedia", "replyImage", "mediaPath", "templateName", "templateId", "template", "message", "caption"];
+  for (const k of copyKeys) if (btn[k] !== undefined && data[k] === undefined) data[k] = btn[k];
+  const node = { id: `${nodeId}::btnreply`, type: "buttonReply", data };
+  return (pickFlowNodeText(data) || pickFlowNodeMedia(node) || pickFlowNodeTemplateRef(data)) ? node : null;
+}
+
 function normalizeFlowButton(btn, idx) {
   if (typeof btn === "string") return { id: `btn_${idx}`, text: btn };
   const b = btn || {};
@@ -1846,8 +1913,8 @@ function resolveFlowButtonClick(flow, rawPayloadId, cleanKeyword, isButtonClick)
   if (!edge && !edges.some((e) => handleOf(e))) edge = edges[0];
 
   const targetNode = edge ? (flow.nodes || []).find((n) => n.id === edge.target) : null;
-  console.log(`🔘 [FLOW BUTTON] node=${best.node.id} button="${best.text}" (#${best.idx}) -> target=${targetNode ? targetNode.id : "NONE (no reply sent)"}`);
-  return { matched: true, targetNode: targetNode || null };
+  console.log(`🔘 [FLOW BUTTON] node=${best.node.id} button="${best.text}" (#${best.idx}) -> target=${targetNode ? targetNode.id : "NONE"} | edges from node: ${edges.map((e) => `${handleOf(e) || "(no-handle)"}->${e.target}`).join(", ") || "none"}`);
+  return { matched: true, targetNode: targetNode || null, button: (best.node.data?.buttons || [])[best.idx], buttonNodeId: best.node.id };
 }
 
 router.get("/", async (req, res) => {
@@ -2050,6 +2117,10 @@ router.post("/", async (req, res) => {
               extractedText = messageData.interactive.list_reply.title || "";
               buttonPayloadId = messageData.interactive.list_reply.id || "";
             }
+          } else if (messageType === "button" && messageData.button) {
+            // Template quick-reply button click (Meta sends type "button", NOT "interactive")
+            extractedText = messageData.button.text || "";
+            buttonPayloadId = messageData.button.payload || "";
           } else if (["image", "video", "document", "audio", "voice"].includes(messageType)) {
             const mediaObject = messageData[messageType];
             const mediaId = mediaObject?.id;
@@ -2263,11 +2334,16 @@ router.post("/", async (req, res) => {
                   const btnRes = resolveFlowButtonClick(flow, buttonPayloadId, cleanKeyword, isButtonClick);
                   if (btnRes.matched) {
                     buttonClickHandled = true;
-                    targetNode = btnRes.targetNode;
+                    targetNode = btnRes.targetNode ? skipEmptyFlowNodes(flow, btnRes.targetNode) : null;
+                    if (!targetNode || !flowNodeHasContent(targetNode)) {
+                      const inlineReply = buttonReplyAsNode(btnRes.button, btnRes.buttonNodeId);
+                      if (inlineReply) { console.log(`↪️ [FLOW] using reply stored inside the button "${btnRes.button?.text || btnRes.button?.title || ""}"`); targetNode = inlineReply; }
+                    }
                   }
                 }
 
-                if (targetNode) {
+                if (targetNode) targetNode = skipEmptyFlowNodes(flow, targetNode);
+if (targetNode) {
                   const nodeData = targetNode.data || {};
                   const nodeMedia = pickFlowNodeMedia(targetNode);
                   const nodeText = pickFlowNodeText(nodeData);
@@ -2281,16 +2357,48 @@ router.post("/", async (req, res) => {
                   const hasButtons = Array.isArray(nodeData.buttons) && nodeData.buttons.length > 0;
 
                   // resolve media reference (upload to Meta first, link as fallback)
+                  const flowTemplateRef = pickFlowNodeTemplateRef(nodeData);
+                  let flowTemplateObj = null;
+                  if (flowTemplateRef) flowTemplateObj = await findTemplateForFlow(targetUserId, flowTemplateRef);
+
                   let mediaRef = null;
                   let cleanMediaUrl = "";
-                  if (nodeMedia) {
+                  if (nodeMedia && !flowTemplateRef) {
                     cleanMediaUrl = normalizePublicMediaLink(nodeMedia.url);
                     let mediaId = null;
                     try { mediaId = await uploadMediaToMeta(metaPhoneNumberId, accessToken, cleanMediaUrl); } catch (upErr) { console.warn("⚠️ Flow media upload warning:", upErr.message); }
                     mediaRef = mediaId ? { id: mediaId } : { link: cleanMediaUrl };
                   }
 
-                  if (hasButtons) {
+                  if (flowTemplateRef) {
+                    // ✅ Node is linked to a Template -> send the real template (with its header media), not "Hello!"
+                    const tplName = flowTemplateObj?.name || flowTemplateObj?.title || flowTemplateRef;
+                    let langCode = flowTemplateObj?.language || "en_US";
+                    const hdr = await resolveTemplateHeader(targetUserId, flowTemplateObj, tplName, { mediaUrl: nodeMedia?.url, replyText: nodeText }, metaPhoneNumberId, accessToken);
+                    if (!flowTemplateObj?.language && hdr.meta?.language) langCode = hdr.meta.language;
+                    fallbackPayload = buildTemplateFallbackPayload(hdr, flowTemplateObj, { replyText: nodeText });
+
+                    const tplComponents = [];
+                    const needsMedia = TEMPLATE_MEDIA_FORMATS.includes(hdr.format);
+                    if (needsMedia && (hdr.mediaId || hdr.link)) {
+                      const mt = hdr.format.toLowerCase();
+                      const ref = hdr.mediaId ? { id: hdr.mediaId } : { link: hdr.link };
+                      tplComponents.push({
+                        type: "header",
+                        parameters: [ mt === "document"
+                          ? { type: "document", document: { ...ref, filename: path.basename((hdr.link || "file").split("?")[0]) || "file" } }
+                          : { type: mt, [mt]: ref } ]
+                      });
+                    }
+                    if (needsMedia && !hdr.mediaId && !hdr.link) {
+                      flowPayload = fallbackPayload;
+                      fallbackPayload = null;
+                      savedType = flowPayload.type || "text";
+                    } else {
+                      flowPayload = { type: "template", template: { name: tplName, language: { code: langCode }, ...(tplComponents.length > 0 && { components: tplComponents }) } };
+                      savedType = "template";
+                    }
+                  } else if (hasButtons) {
                     const seenTitles = new Set();
                     const formattedButtons = nodeData.buttons.filter((btn) => {
                       const t = String(typeof btn === "string" ? btn : (btn?.text || btn?.title || "")).trim().toLowerCase();
@@ -2346,7 +2454,14 @@ router.post("/", async (req, res) => {
                     fallbackPayload = { type: "text", text: { body: nodeText || cleanMediaUrl } };
                     savedType = nodeMedia.kind;
                   } else {
-                    flowPayload = { type: "text", text: { body: nodeText || pickFlowNodeText(nodeData, true) || "Hello!" } };
+                    const labelText = nodeText || pickFlowNodeText(nodeData, true);
+                    if (labelText) {
+                      flowPayload = { type: "text", text: { body: labelText } };
+                    } else {
+                      // Nothing usable found on this node: do NOT send a fake "Hello!" - log the node so it can be fixed.
+                      flowPayload = {};
+                      console.error(`❌ [FLOW NODE EMPTY] id=${targetNode.id} type=${targetNode.type} has no text / media / template the server understands. Check the logged dataKeys above.`);
+                    }
                   }
 
                   if (flowPayload && Object.keys(flowPayload).length > 0) {
@@ -2381,10 +2496,10 @@ router.post("/", async (req, res) => {
                         sender: "me",
                         isBotMessage: true,
                         type: savedType,
-                        text: nodeText || "[Visual Flow Triggered]",
+                        text: nodeText || (flowTemplateRef ? `[Template Triggered: ${flowTemplateRef}]` : "[Visual Flow Triggered]"),
                         origin: "auto_reply",
                         buttons: toStoredButtons(nodeData.buttons),
-                        mediaUrl: nodeMedia ? nodeMedia.url : null,
+                        mediaUrl: nodeMedia ? nodeMedia.url : (flowTemplateObj?.mediaUrl || null),
                         assignedTo: currentAssignedContext,
                         status: "sent"
                       }).save();
@@ -2811,16 +2926,25 @@ router.post("/", async (req, res) => {
                       const btnRes = resolveFlowButtonClick(flow, buttonPayloadId, cleanKeyword, isButtonClick);
                       if (btnRes.matched) {
                         buttonClickHandled = true;
-                        targetNode = btnRes.targetNode;
+                        targetNode = btnRes.targetNode ? skipEmptyFlowNodes(flow, btnRes.targetNode) : null;
+                        if (!targetNode || !flowNodeHasContent(targetNode)) {
+                          const inlineReply = buttonReplyAsNode(btnRes.button, btnRes.buttonNodeId);
+                          if (inlineReply) { console.log(`↪️ [FLOW] using reply stored inside the button "${btnRes.button?.text || btnRes.button?.title || ""}"`); targetNode = inlineReply; }
+                        }
                       }
                     }
 
-                    if (targetNode) {
+                    if (targetNode) targetNode = skipEmptyFlowNodes(flow, targetNode);
+if (targetNode) {
                       const nodeData = targetNode.data || {};
-                      const replyText = pickFlowNodeText(nodeData) || pickFlowNodeText(nodeData, true) || "Hello!";
+                      const replyText = pickFlowNodeText(nodeData) || pickFlowNodeText(nodeData, true) || "";
                       const buttonsList = nodeData.buttons || [];
                       const flowNodeMedia = pickFlowNodeMedia(targetNode);
                       const flowMediaUrl = flowNodeMedia ? flowNodeMedia.url : null;
+                      if (!replyText && !flowMediaUrl && buttonsList.length === 0) {
+                        console.error(`❌ [FLOW NODE EMPTY] id=${targetNode.id} type=${targetNode.type} dataKeys=[${Object.keys(nodeData).join(",")}] - nothing to send (no fake "Hello!").`);
+                        continue;
+                      }
                       console.log(`🎯 [FLOW NODE] id=${targetNode.id} type=${targetNode.type} media=${flowMediaUrl || "none"} dataKeys=[${Object.keys(nodeData).join(",")}]`);
                       try { console.log(`🧾 [FLOW NODE DATA] ${JSON.stringify(nodeData).substring(0, 900)}`); } catch (e) {}
 

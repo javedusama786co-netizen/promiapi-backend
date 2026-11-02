@@ -34,6 +34,20 @@ const upload = multer({
   limits: { fileSize: 100 * 1024 * 1024 }
 });
 
+// 🔐 token sanitiser (quotes / newlines in saved tokens were breaking the Authorization header)
+const cleanTok = (tok) => String(tok || "").replace(/^[\"']|[\"']$/g, "").trim().replace(/[\r\n]+/g, "");
+
+// 🆔 Resumable-upload API needs the Facebook APP id (NOT the WABA id).
+async function resolveAppId(token) {
+  const envId = process.env.FACEBOOK_APP_ID || process.env.META_APP_ID || process.env.FB_APP_ID;
+  if (envId) return String(envId).trim();
+  try {
+    const r = await axios.get("https://graph.facebook.com/v20.0/debug_token", { params: { input_token: token, access_token: token } });
+    if (r.data?.data?.app_id) return String(r.data.data.app_id);
+  } catch (e) { /* ignore */ }
+  return "1543305467331355"; // same default used in whatsappConfig.js
+}
+
 // Helper function for robust user query filter (Strictly targeting Official WhatsApp & Meta Config)
 const getMetaConfigQuery = (user) => {
   const businessScopeId = user.adminId || user.id || user._id;
@@ -70,12 +84,14 @@ router.get("/sync-meta", auth, async (req, res) => {
       });
     }
 
-    const response = await axios.get(
-      `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?limit=100`,
-      { headers: { Authorization: `Bearer ${userConfig.accessToken}` } }
-    );
-
-    const metaTemplates = response.data?.data || [];
+    const syncToken = cleanTok(userConfig.accessToken);
+    let metaTemplates = [];
+    let nextUrl = `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?limit=100`;
+    for (let page = 0; nextUrl && page < 20; page++) {
+      const response = await axios.get(nextUrl, { headers: { Authorization: `Bearer ${syncToken}` } });
+      metaTemplates = metaTemplates.concat(response.data?.data || []);
+      nextUrl = response.data?.paging?.next || null;
+    }
     const savedTemplates = [];
 
     const businessScopeId = req.user.adminId || req.user.id;
@@ -145,7 +161,9 @@ router.get("/sync-meta", auth, async (req, res) => {
 
     return res.json({ success: true, message: `${savedTemplates.length} Templates synchronized!`, templates: savedTemplates });
   } catch (err) {
-    return res.status(500).json({ success: false, message: "Sync error occurred.", error: err.message });
+    const metaMsg = err.response?.data?.error?.message;
+    console.error("❌ Sync Error:", err.response?.data || err.message);
+    return res.status(500).json({ success: false, message: metaMsg ? `Meta error: ${metaMsg}` : "Sync error occurred.", error: err.response?.data?.error || err.message });
   }
 });
 
@@ -208,6 +226,8 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
 
     let metaSyncedStatus = false;
     let metaNotice = "Saved locally on dashboard testing mode.";
+    let headerUploadFailed = false;
+    let headerUploadError = "";
 
     if (userConfig && userConfig.accessToken && userConfig.businessAccountId) {
       const metaComponents = [];
@@ -235,11 +255,13 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
       } 
       else if (headerType && headerType !== "none" && headerType !== "text") {
         let metaHeaderHandle = "";
+        const upToken = cleanTok(userConfig.accessToken);
 
-        if (req.file && fs.existsSync(req.file.path)) {
-          const fileStats = fs.statSync(req.file.path);
-          const fileSize = fileStats.size;
-          
+        if (!req.file || !fs.existsSync(req.file.path)) {
+          headerUploadError = "Header media file was not received by the server.";
+        } else {
+          const fileSize = fs.statSync(req.file.path).size;
+
           let normalizedMime = req.file.mimetype;
           if (!normalizedMime || normalizedMime === "application/octet-stream") {
             if (headerType === "image") normalizedMime = "image/jpeg";
@@ -247,62 +269,31 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
             else if (headerType === "document") normalizedMime = "application/pdf";
           }
 
-          let uploadSessionId = "";
           try {
+            // Step 1: create upload session on the APP id (WABA id / "app" literal do not work)
+            const appId = await resolveAppId(upToken);
             const sessionRes = await axios.post(
-              `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/uploads`,
+              `https://graph.facebook.com/v20.0/${appId}/uploads`,
               null,
+              { params: { file_length: fileSize, file_type: normalizedMime, file_name: req.file.originalname, access_token: upToken } }
+            );
+            const uploadSessionId = sessionRes.data.id;
+
+            // Step 2: send the RAW file bytes (multipart/form-data corrupts the file and Meta then rejects the handle)
+            const uploadRes = await axios.post(
+              `https://graph.facebook.com/v20.0/${uploadSessionId}`,
+              fs.readFileSync(req.file.path),
               {
-                params: {
-                  file_length: fileSize,
-                  file_type: normalizedMime,
-                  access_token: userConfig.accessToken
-                }
+                headers: { Authorization: `OAuth ${upToken}`, file_offset: "0", "Content-Type": "application/octet-stream" },
+                maxBodyLength: Infinity,
+                maxContentLength: Infinity
               }
             );
-            uploadSessionId = sessionRes.data.id;
-          } catch (primaryEndpointErr) {
-            try {
-              const appSessionRes = await axios.post(
-                `https://graph.facebook.com/v20.0/app/uploads`,
-                null,
-                {
-                  params: {
-                    file_length: fileSize,
-                    file_type: normalizedMime,
-                    access_token: userConfig.accessToken
-                  }
-                }
-              );
-              uploadSessionId = appSessionRes.data.id;
-            } catch (fallbackEndpointErr) {
-              console.error("❌ BOTH UPLOAD ENDPOINTS FAILED COMPLETELY:", fallbackEndpointErr.response?.data || fallbackEndpointErr.message);
-            }
-          }
-
-          if (uploadSessionId) {
-            try {
-              const form = new FormData();
-              form.append("file", fs.createReadStream(req.file.path));
-
-              const uploadRes = await axios.post(
-                `https://graph.facebook.com/v20.0/${uploadSessionId}`,
-                form,
-                {
-                  headers: {
-                    ...form.getHeaders(),
-                    "Authorization": `OAuth ${userConfig.accessToken}`,
-                    "file_offset": 0
-                  }
-                }
-              );
-
-              if (uploadRes.data && uploadRes.data.h) {
-                metaHeaderHandle = uploadRes.data.h;
-              }
-            } catch (binaryStreamErr) {
-              console.error("❌ BINARY UPLOAD CRASHED:", binaryStreamErr.response?.data || binaryStreamErr.message);
-            }
+            if (uploadRes.data && uploadRes.data.h) metaHeaderHandle = uploadRes.data.h;
+            else headerUploadError = "Meta did not return a media handle.";
+          } catch (upErr) {
+            headerUploadError = upErr.response?.data?.error?.message || upErr.message;
+            console.error("❌ META MEDIA HANDLE UPLOAD FAILED:", upErr.response?.data || upErr.message);
           }
         }
 
@@ -313,7 +304,7 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
             example: { header_handle: [ metaHeaderHandle ] }
           });
         } else {
-          throw new Error("Meta media handle could not be initialized due to incorrect Account Setup configurations.");
+          headerUploadFailed = true; // template is already saved locally; report the real reason instead of a 500
         }
       }
 
@@ -348,11 +339,13 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
         components: metaComponents
       };
 
-      try {
+      if (headerUploadFailed) {
+        metaNotice = `Saved locally! Meta media upload failed: ${headerUploadError || "unknown error"}`;
+      } else try {
         const metaRes = await axios.post(
           `https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates`, 
           metaPayload, 
-          { headers: { Authorization: `Bearer ${userConfig.accessToken}`, "Content-Type": "application/json" } }
+          { headers: { Authorization: `Bearer ${cleanTok(userConfig.accessToken)}`, "Content-Type": "application/json" } }
         );
         
         metaSyncedStatus = true;
@@ -363,7 +356,7 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
         }
       } catch (metaErr) {
         console.error("❌ META REGISTRATION REJECTION DETAILS:", metaErr.response?.data || metaErr.message);
-        metaNotice = `Saved locally! (Meta API notice: ${metaErr.response?.data?.error?.message || "Check fields format"})`;
+        metaNotice = `Saved locally! (Meta API notice: ${metaErr.response?.data?.error?.message || "Check fields format"})${metaErr.response?.data?.error?.error_user_msg ? " - " + metaErr.response.data.error.error_user_msg : ""}`;
       }
     }
 
@@ -405,8 +398,8 @@ router.delete("/:id", auth, async (req, res) => {
 
     if (userConfig && userConfig.accessToken && userConfig.businessAccountId) {
       try {
-        await axios.delete(`https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?name=${targetTemplate.name}`, {
-          headers: { Authorization: `Bearer ${userConfig.accessToken}` }
+        await axios.delete(`https://graph.facebook.com/v20.0/${userConfig.businessAccountId}/message_templates?name=${encodeURIComponent(targetTemplate.name)}`, {
+          headers: { Authorization: `Bearer ${cleanTok(userConfig.accessToken)}` }
         });
       } catch (metaErr) {
         console.warn("⚠️ Meta remove warning:", metaErr.response?.data || metaErr.message);
