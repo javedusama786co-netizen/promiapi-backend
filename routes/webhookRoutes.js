@@ -1339,7 +1339,7 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   const temperature = settings.groq?.temperature ?? settings.openai?.temperature ?? 0.7;
   const systemPrompt = settings.groq?.systemPrompt || settings.openai?.systemPrompt || "You are a helpful customer support assistant on WhatsApp. Reply briefly and clearly in the customer's language.";
 
-  const waRules = "\n\nIMPORTANT RULES (WhatsApp channel):\n1. Answer ONLY what the customer asked in their latest message. Do NOT add extra details, other services, features, steps, login instructions or integrations that they did not ask about.\n2. Keep it very short: 2-4 short sentences, under 500 characters. Avoid long lists.\n3. If the question is broad (for example 'tell me your services' or 'details'), give a ONE-line overview and ask which specific thing they want to know more about.\n4. Do not repeat information that was already given earlier in the chat.\n5. Plain text only: no markdown tables, no # headings. Use *single asterisks* for bold.\n6. Reply in the same language and script the customer writes in.";
+  const waRules = "\n\nIMPORTANT RULES (WhatsApp channel):\n1. Answer ONLY what the customer asked in their latest message. Do NOT add extra details, other services, features or integrations they did not ask about.\n2. Never write one big paragraph. Use short lines separated by blank lines. For how-to questions use a numbered list (maximum 6 steps, one short line each). For other questions use 2-4 short sentences. Stay under 900 characters.\n3. If the question is broad (for example 'tell me your services' or 'details'), give a ONE-line overview and ask which specific thing they want to know more about.\n4. Do not repeat information that was already given earlier in the chat.\n5. Plain text only: no markdown tables, no # headings. Use *single asterisks* for bold, and '1.' or '-' for lists.\n6. Reply in the same language and script the customer writes in.\n7. Tone: polite, professional and friendly. Use at most one emoji. End with one short line offering further help.";
   const messages = [{ role: "system", content: systemPrompt + waRules }];
 
   const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ createdAt: -1 }).limit(12).lean();
@@ -1357,7 +1357,7 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   console.log(`🤖 [GROQ] Calling model=${model} | user=${userId} | customer=${customerPhone} | history=${history.length} | tools=${tools.length}`);
 
   for (let round = 0; round < 3; round++) {
-    const body = { model, messages, temperature: Math.min(temperature, 0.5), max_tokens: 600 };
+    const body = { model, messages, temperature: Math.min(temperature, 0.5), max_tokens: 700 };
     if (/gpt-oss/i.test(model)) body.reasoning_effort = "low"; // less hidden "thinking" tokens, faster replies
     if (tools.length) { body.tools = tools; body.tool_choice = "auto"; }
 
