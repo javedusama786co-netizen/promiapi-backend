@@ -1136,6 +1136,7 @@ async function verifyUserAiSubscription(userId) {
   } catch (err) {
     console.error("⚠️ Subscription Verification Error:", err?.message);
   }
+  console.log(`⛔ [AI SUBSCRIPTION] user=${userId} has no active AI subscription flag (isAiSubscribed / subscriptionActive / isSubscribed / subscriptionStatus=active / planType=ai / plan=pro / aiEnabled) in AiBotSettings or User.`);
   return false;
 }
 
@@ -1253,17 +1254,157 @@ async function handleManualFunctionExecution(targetUserId, customerPhone, cleanK
   return null;
 }
 
+// =========================================================================
+// 🤖 GROQ AI ENGINE (replaces old OpenAI logic)
+// =========================================================================
+const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+// NOTE: llama3-70b-8192 (Aug 2025) and llama-3.3-70b-versatile (Aug 2026) are RETIRED on Groq.
+// Override anytime with GROQ_MODEL in .env
+const GROQ_DEFAULT_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const GROQ_RETIRED_MODELS = {
+  "llama3-70b-8192": "openai/gpt-oss-120b",
+  "llama3-8b-8192": "openai/gpt-oss-20b",
+  "llama-3.1-70b-versatile": "openai/gpt-oss-120b",
+  "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+  "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+  "mixtral-8x7b-32768": "openai/gpt-oss-120b"
+};
+
+function resolveGroqModel(settings) {
+  const requested = String(settings?.groq?.model || settings?.openai?.model || settings?.aiModel || "").trim();
+  if (!requested) return GROQ_DEFAULT_MODEL;
+  if (GROQ_RETIRED_MODELS[requested]) {
+    console.warn(`⚠️ [GROQ] Model "${requested}" is retired on Groq -> using "${GROQ_RETIRED_MODELS[requested]}"`);
+    return GROQ_RETIRED_MODELS[requested];
+  }
+  // Old OpenAI model names saved in the panel (gpt-4o-mini etc.) do not exist on Groq
+  if (/^(gpt-|chatgpt|o1|o3|o4)/i.test(requested)) {
+    console.warn(`⚠️ [GROQ] "${requested}" is an OpenAI model name, not valid on Groq -> using "${GROQ_DEFAULT_MODEL}"`);
+    return GROQ_DEFAULT_MODEL;
+  }
+  return requested;
+}
+
+function resolveGroqApiKey(settings) {
+  const candidates = [
+    settings?.groq?.apiKey,
+    settings?.openai?.apiKey,
+    settings?.openaiApiKey,
+    settings?.groqApiKey,
+    process.env.GROQ_API_KEY
+  ];
+  for (const c of candidates) {
+    const key = String(c || "").replace(/^["']|["']$/g, "").trim();
+    if (key) return key;
+  }
+  return null;
+}
+
+function buildGroqTools(settings) {
+  const noParams = { type: "object", properties: {}, required: [] };
+  const tools = [
+    { type: "function", function: { name: "get_customer_orders_status", description: "Fetch real-time order status, courier tracking, and details from database for this customer.", parameters: noParams } }
+  ];
+  // Banking tools only when a real external CBS API is configured (otherwise fetchExternalCBSData returns FAKE demo data)
+  const hasExternalApi = Boolean(settings?.externalApi?.baseUrl || process.env.EXTERNAL_CBS_API_URL);
+  if (hasExternalApi) {
+    tools.push(
+      { type: "function", function: { name: "get_bank_account_balance", description: "Fetch customer bank account balance, account number, and status from CBS.", parameters: noParams } },
+      { type: "function", function: { name: "get_transaction_history", description: "Fetch recent transaction history for customer bank account.", parameters: noParams } },
+      { type: "function", function: { name: "block_credit_card", description: "Block lost or stolen credit or debit card immediately.", parameters: noParams } },
+      { type: "function", function: { name: "request_cheque_book", description: "Order a new cheque book delivery for customer account.", parameters: noParams } },
+      { type: "function", function: { name: "apply_for_personal_loan", description: "Check personal loan eligibility and initiate new loan application.", parameters: noParams } },
+      { type: "function", function: { name: "get_forex_rates", description: "Get current live foreign exchange rates for currencies.", parameters: noParams } }
+    );
+  }
+  return tools;
+}
+
+async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
+  const model = resolveGroqModel(settings);
+  const temperature = settings.groq?.temperature ?? settings.openai?.temperature ?? 0.7;
+  const systemPrompt = settings.groq?.systemPrompt || settings.openai?.systemPrompt || "You are a helpful customer support assistant on WhatsApp. Reply briefly and clearly in the customer's language.";
+
+  const messages = [{ role: "system", content: systemPrompt }];
+
+  const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ createdAt: -1 }).limit(12).lean();
+  const history = chatHistory.reverse()
+    .map((m) => ({ role: m.sender === "me" ? "assistant" : "user", content: typeof m.text === "string" ? m.text.trim() : "" }))
+    .filter((m) => m.content); // Groq rejects empty message content (media-only messages have no text)
+
+  // The incoming message is usually already saved in DB -> avoid sending it twice
+  const lastHist = history[history.length - 1];
+  if (lastHist && lastHist.role === "user" && lastHist.content === String(userText || "").trim()) history.pop();
+  messages.push(...history);
+  messages.push({ role: "user", content: String(userText || "").trim() || "Hello" });
+
+  let tools = buildGroqTools(settings);
+  console.log(`🤖 [GROQ] Calling model=${model} | user=${userId} | customer=${customerPhone} | history=${history.length} | tools=${tools.length}`);
+
+  for (let round = 0; round < 3; round++) {
+    const body = { model, messages, temperature, max_tokens: 1024 };
+    if (tools.length) { body.tools = tools; body.tool_choice = "auto"; }
+
+    let aiRes;
+    try {
+      aiRes = await axios.post(GROQ_API_URL, body, {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        timeout: 30000
+      });
+    } catch (err) {
+      // Some Groq models occasionally fail tool-calling (400) -> retry once without tools
+      if (err.response?.status === 400 && tools.length) {
+        console.warn("⚠️ [GROQ] 400 with tools, retrying without tools:", JSON.stringify(err.response?.data));
+        tools = [];
+        continue;
+      }
+      console.error(`❌ [GROQ] Request failed | status=${err.response?.status || "no-response"} |`, JSON.stringify(err.response?.data) || err.message);
+      return null;
+    }
+
+    const msg = aiRes.data?.choices?.[0]?.message;
+    if (!msg) { console.error("❌ [GROQ] Empty response:", JSON.stringify(aiRes.data)); return null; }
+
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+      messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
+      for (const call of msg.tool_calls) {
+        let args = {};
+        try { args = JSON.parse(call.function?.arguments || "{}"); } catch (_) {}
+        const result = await fetchExternalCBSData(call.function.name, args, customerPhone, settings);
+        messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+      }
+      continue;
+    }
+
+    const content = typeof msg.content === "string"
+      ? msg.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
+      : "";
+    if (content) {
+      console.log(`✅ [GROQ] Reply generated (${content.length} chars)`);
+      return content;
+    }
+    console.warn("⚠️ [GROQ] Model returned empty content");
+    return null;
+  }
+  return null;
+}
+
 async function processAiBotResponse(userId, customerPhone, userText) {
   try {
     const isSubscribed = await verifyUserAiSubscription(userId);
     if (!isSubscribed) {
+      console.log(`⛔ [AI SKIP] user=${userId} is not AI-subscribed`);
       return null;
     }
 
     const settings = await AiBotSettings.findOne({ userId });
-    if (!settings) return null;
+    if (!settings) {
+      console.log(`⛔ [AI SKIP] No AiBotSettings document for user=${userId}`);
+      return null;
+    }
 
     if (!isWithinOperatingHours(settings.timing)) {
+      console.log(`⛔ [AI SKIP] Outside operating hours for user=${userId}`);
       return null;
     }
 
@@ -1274,12 +1415,9 @@ async function processAiBotResponse(userId, customerPhone, userText) {
     if (settings.flowise?.enabled && settings.flowise?.apiUrl) {
       try {
         const flowiseRes = await axios.post(
-          settings.flowise.apiUrl, 
+          settings.flowise.apiUrl,
           { question: userText },
-          {
-            headers: { "Accept-Encoding": "gzip, deflate, br" },
-            decompress: true
-          }
+          { timeout: 30000 }
         );
         const text = flowiseRes.data?.text || flowiseRes.data?.textResponse || flowiseRes.data;
         if (typeof text === "string" && text.trim()) {
@@ -1290,150 +1428,16 @@ async function processAiBotResponse(userId, customerPhone, userText) {
       }
     }
 
-    if (settings.openai?.enabled && settings.openai?.apiKey) {
-      try {
-        const messages = [];
-        if (settings.openai.systemPrompt) {
-          messages.push({ role: "system", content: settings.openai.systemPrompt });
-        }
+    const aiEnabled = settings.openai?.enabled === true || settings.groq?.enabled === true;
+    const apiKey = resolveGroqApiKey(settings);
 
-        const chatHistory = await ChatMessage.find({ userId, customerPhone })
-          .sort({ createdAt: -1 })
-          .limit(12);
-        
-        chatHistory.reverse().forEach((msg) => {
-          messages.push({
-            role: msg.sender === "me" ? "assistant" : "user",
-            content: msg.text || "",
-          });
-        });
-
-        messages.push({ role: "user", content: userText });
-
-        const tools = [
-          {
-            type: "function",
-            function: {
-              name: "get_bank_account_balance",
-              description: "Fetch customer bank account balance, account number, and status from CBS.",
-              parameters: { type: "object", properties: {}, required: [] }
-            }
-          },
-          {
-            type: "function",
-            function: {
-              name: "get_transaction_history",
-              description: "Fetch recent transaction history for customer bank account.",
-              parameters: { type: "object", properties: {}, required: [] }
-            }
-          },
-          {
-            type: "function",
-            function: {
-              name: "block_credit_card",
-              description: "Block lost or stolen credit or debit card immediately.",
-              parameters: { type: "object", properties: {}, required: [] }
-            }
-          },
-          {
-            type: "function",
-            function: {
-              name: "request_cheque_book",
-              description: "Order a new cheque book delivery for customer account.",
-              parameters: { type: "object", properties: {}, required: [] }
-            }
-          },
-          {
-            type: "function",
-            function: {
-              name: "apply_for_personal_loan",
-              description: "Check personal loan eligibility and initiate new loan application.",
-              parameters: { type: "object", properties: {}, required: [] }
-            }
-          },
-          {
-            type: "function",
-            function: {
-              name: "get_forex_rates",
-              description: "Get current live foreign exchange rates for currencies.",
-              parameters: { type: "object", properties: {}, required: [] }
-            }
-          },
-          {
-            type: "function",
-            function: {
-              name: "get_customer_orders_status",
-              description: "Fetch real-time order status, courier tracking, and details from database for this customer.",
-              parameters: { type: "object", properties: {}, required: [] }
-            }
-          }
-        ];
-
-        const openAiRes = await axios.post(
-          "https://api.groq.com/openai/v1/chat/completions", // ✅ Groq Base URL
-          {
-            model: "llama3-70b-8192", // ✅ Groq ka fast aur powerful model
-            messages,
-            tools,
-            tool_choice: "auto",
-            temperature: settings.openai.temperature ?? 0.7,
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${settings.openai.apiKey}`, // Yahan aap dashboard mein Groq ki key save karenge
-              "Content-Type": "application/json",
-              "Accept-Encoding": "gzip, deflate, br"
-            },
-            decompress: true
-          }
-        );
-
-        const responseMessage = openAiRes.data?.choices?.[0]?.message;
-
-        if (responseMessage?.tool_calls && responseMessage.tool_calls.length > 0) {
-          const toolCall = responseMessage.tool_calls[0];
-          const functionName = toolCall.function.name;
-          const functionArgs = JSON.parse(toolCall.function.arguments || "{}");
-
-          const toolExecutionData = await fetchExternalCBSData(functionName, functionArgs, customerPhone, settings);
-
-          messages.push(responseMessage);
-          messages.push({
-            tool_call_id: toolCall.id,
-            role: "tool",
-            name: functionName,
-            content: JSON.stringify(toolExecutionData)
-          });
-
-          const secondAiRes = await axios.post(
-            "https://api.groq.com/openai/v1/chat/completions", // ✅ Groq URL
-            {
-              model: "llama3-70b-8192", // ✅ Groq Model
-              messages,
-              temperature: settings.openai.temperature ?? 0.7
-            },
-            {
-              headers: {
-                Authorization: `Bearer ${settings.openai.apiKey}`,
-                "Content-Type": "application/json",
-                "Accept-Encoding": "gzip, deflate, br"
-              },
-              decompress: true
-            }
-          );
-
-          const finalReply = secondAiRes.data?.choices?.[0]?.message?.content;
-          if (finalReply && finalReply.trim()) {
-            return finalReply.trim();
-          }
-        }
-
-        if (responseMessage?.content && responseMessage.content.trim()) {
-          return responseMessage.content.trim();
-        }
-      } catch (oErr) {
-        console.error("❌ OpenAI API Request Failed:", oErr.response?.data || oErr.message);
-      }
+    if (!aiEnabled) {
+      console.log(`⛔ [AI SKIP] AI toggle is OFF in settings (openai.enabled / groq.enabled) for user=${userId}`);
+    } else if (!apiKey) {
+      console.log(`⛔ [AI SKIP] No Groq API key found (checked groq.apiKey, openai.apiKey, openaiApiKey, GROQ_API_KEY env) for user=${userId}`);
+    } else {
+      const reply = await runGroqChat(userId, customerPhone, userText, settings, apiKey);
+      if (reply) return reply;
     }
 
     if (settings.general?.failedMessage) {

@@ -8,22 +8,36 @@ const AiBotSettingsSchema = new mongoose.Schema(
       required: true,
       unique: true,
     },
+
+    // 💳 AI subscription flag.
+    // webhookRoutes.js -> verifyUserAiSubscription() checks this field first.
+    // It was missing from the schema earlier, so Mongoose (strict mode) silently dropped it on save.
+    isAiSubscribed: { type: Boolean, default: false },
+
     general: {
       failedMessage: { type: String, default: "" },
       enableForNewContacts: { type: Boolean, default: false },
     },
+
+    // 🤖 AI provider settings.
+    // NOTE: the key is still called "openai" so the existing dashboard/API keep working,
+    // but the backend now sends these values to GROQ (https://api.groq.com/openai/v1).
+    //   apiKey -> your GROQ API key (starts with gsk_...)
+    //   model  -> a GROQ model id. OpenAI names (gpt-4o etc.) and retired Llama models are auto-replaced in code.
     openai: {
       enabled: { type: Boolean, default: false },
       apiKey: { type: String, default: "" },
-      model: { type: String, default: "gpt-4o" },
+      model: { type: String, default: "openai/gpt-oss-120b" },
       systemPrompt: { type: String, default: "" },
       temperature: { type: Number, default: 0.7 },
     },
+
     flowise: {
       enabled: { type: Boolean, default: false },
       apiUrl: { type: String, default: "" },
     },
-    // 🌐 External Server / Bank CBS API Settings Schema Added
+
+    // 🌐 External Server / Bank CBS API Settings
     externalApi: {
       enabled: { type: Boolean, default: false },
       baseUrl: { type: String, default: "" },
@@ -31,6 +45,7 @@ const AiBotSettingsSchema = new mongoose.Schema(
       apiSecret: { type: String, default: "" },
       description: { type: String, default: "" },
     },
+
     timing: {
       enabled: { type: Boolean, default: false },
       startTime: { type: String, default: "" },
@@ -49,6 +64,7 @@ const AiBotSettingsSchema = new mongoose.Schema(
         stopAiBot: { type: Boolean, default: false },
       },
     },
+
     advanced: {
       handoverKeyword: { type: String, default: "" },
       responseDelay: { type: Number, default: 0 },
@@ -57,4 +73,6 @@ const AiBotSettingsSchema = new mongoose.Schema(
   { timestamps: true }
 );
 
-module.exports = mongoose.model("AiBotSettings", AiBotSettingsSchema);
+// Safe re-registration (prevents OverwriteModelError on hot-reload)
+module.exports =
+  mongoose.models.AiBotSettings || mongoose.model("AiBotSettings", AiBotSettingsSchema);
