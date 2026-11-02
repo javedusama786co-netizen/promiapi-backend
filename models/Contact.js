@@ -68,8 +68,16 @@ const contactSchema = new mongoose.Schema(
     ],
     status: {
       type: String,
-      enum: ['ACTIVE', 'INVALID', 'BLOCKED', 'PENDING'],
+      // UNSUBSCRIBED / PENDING_AGENT / ASSIGNED webhookRoutes.js aur contacts.js dono set karte hain,
+      // pehle enum mein nahi thay (save() par validation error aata tha)
+      enum: ['ACTIVE', 'INVALID', 'BLOCKED', 'PENDING', 'UNSUBSCRIBED', 'PENDING_AGENT', 'ASSIGNED'],
       default: 'ACTIVE'
+    },
+    // WhatsApp number kab verify hua. null/missing = abhi check nahi hua.
+    // "Verify WhatsApp" button sirf inhi contacts ko check karta hai.
+    waCheckedAt: {
+      type: Date,
+      default: null
     }
   },
   {
@@ -81,5 +89,6 @@ const contactSchema = new mongoose.Schema(
 contactSchema.index({ userId: 1, platform: 1 });
 contactSchema.index({ userId: 1, phone: 1 });
 contactSchema.index({ userId: 1, recipientId: 1 });
+contactSchema.index({ userId: 1, platform: 1, waCheckedAt: 1 });
 
 module.exports = mongoose.model('Contact', contactSchema);

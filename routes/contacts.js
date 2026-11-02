@@ -43,6 +43,21 @@ function formatToInternationalPhone(phoneStr) {
   return cleaned;
 }
 
+
+// 🟢 Owner / scope resolver — config aur QR socket hamesha admin (adminId || id) ke naam par hote hain
+function resolveOwner(user) {
+  const userId = user.id || user._id;
+  const adminId = user.adminId || null;
+  const role = user.role ? String(user.role).toLowerCase() : 'admin';
+  const ownerId = adminId || userId;
+  const scope = (role === 'agent' && adminId)
+    ? { $or: [{ userId: userId }, { userId: adminId }] }
+    : { $or: [{ userId: userId }, { adminId: userId }] };
+  return { userId, adminId, ownerId, role, scope };
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
 // 🟢 Helper Function to Fetch WhatsApp DP via Active Baileys Socket
 async function fetchContactDp(phone, userId) {
   try {
@@ -104,199 +119,130 @@ function resolveContactIds({ platform, phone, recipientId, facebookId, instagram
   };
 }
 
-// 🟢 STRICT WHATSAPP STATUS CHECK (FIXED: Non-WhatsApp numbers will strictly be marked INVALID)
-async function checkWhatsAppStatus(phone, userId) {
+// 🟢 WHATSAPP STATUS CHECK
+// Returns { status, phone, checked }
+//   checked = true  -> number asal mein verify hua (Baileys QR socket se)
+//   checked = false -> verify nahi ho saka (Official Cloud API mein pehle se check ka endpoint hi nahi hai,
+//                      ya temporary error). Aise number ko kabhi INVALID mark nahi karte.
+async function checkWhatsAppStatus(phone, ownerId) {
   const cleanPhone = formatToInternationalPhone(phone);
-  if (!cleanPhone) return { status: 'INVALID', phone: cleanPhone };
+  if (!cleanPhone) return { status: 'INVALID', phone: cleanPhone, checked: true };
+
+  const activeSock = getActiveSocket(ownerId) || getActiveSocket(String(ownerId));
+  if (!activeSock) {
+    return { status: 'ACTIVE', phone: cleanPhone, checked: false };
+  }
 
   try {
-    // 1. Check via Baileys Socket if active
-    const activeSock = getActiveSocket(userId) || getActiveSocket(String(userId));
-    if (activeSock) {
-      try {
-        const [result] = await activeSock.onWhatsApp(cleanPhone);
-        if (result && result.exists) {
-          return { status: 'ACTIVE', phone: (result.jid ? result.jid.split('@')[0] : cleanPhone) };
-        } else {
-          return { status: 'INVALID', phone: cleanPhone };
-        }
-      } catch (bailErr) {
-        console.warn(`⚠️ Baileys single check warning for ${phone}:`, bailErr.message);
-      }
+    const [result] = await activeSock.onWhatsApp(cleanPhone);
+    if (result && result.exists) {
+      return { status: 'ACTIVE', phone: (result.jid ? result.jid.split('@')[0] : cleanPhone), checked: true };
     }
-
-    // 2. Check via Official Meta Cloud API if configured
-    let configRecord = null;
-if (WhatsAppConfig) {
-  const isObjectId = mongoose.Types.ObjectId.isValid(userId);
-  const userCond = [{ userId: userId }, { userId: String(userId) }];
-  if (isObjectId) userCond.push({ userId: new mongoose.Types.ObjectId(userId) });
-  
-  configRecord = await WhatsAppConfig.findOne({ 
-    $or: userCond, 
-    platform: { $in: ["whatsapp", "whatsapp_official", "whatsapp_qr"] } 
-  }).sort({ updatedAt: -1 });
-}
-
-    if (configRecord && configRecord.phoneNumberId && configRecord.accessToken) {
-      const { phoneNumberId, accessToken } = configRecord;
-      const metaUrl = `https://graph.facebook.com/v20.0/${phoneNumberId}/contacts`;
-
-      const response = await axios.post(
-        metaUrl,
-        { blocking: 'wait', contacts: [`+${cleanPhone}`] },
-        {
-          headers: {
-            Authorization: `Bearer ${accessToken}`,
-            'Content-Type': 'application/json'
-          },
-          timeout: 4000
-        }
-      );
-
-      const contactResult = response.data?.contacts?.[0];
-      if (contactResult && contactResult.status === 'valid') {
-        return { status: 'ACTIVE', phone: contactResult.wa_id || cleanPhone };
-      } else {
-        return { status: 'INVALID', phone: cleanPhone };
-      }
-    }
-
-    // 3. Strict Default Fallback if no active gateway is connected
-    return { status: 'INVALID', phone: cleanPhone };
+    return { status: 'INVALID', phone: cleanPhone, checked: true };
   } catch (err) {
-    console.error(`❌ checkWhatsAppStatus error for ${phone}:`, err.message);
-    return { status: 'INVALID', phone: cleanPhone };
+    console.warn(`⚠️ Baileys check warning for ${phone}:`, err.message);
+    return { status: 'ACTIVE', phone: cleanPhone, checked: false };
   }
 }
 
 // =========================================================
-// 🛡️ BULK WHATSAPP NUMBER VERIFICATION GATEWAY (STRICT & PROFESSIONAL)
+// 🛡️ BULK WHATSAPP VERIFICATION — sirf wo contacts jo abhi check nahi hue (waCheckedAt == null)
 // =========================================================
 router.post('/verify-whatsapp', auth, async (req, res) => {
   try {
-    const userId = req.user.id || req.user._id;
-    const activeSock = getActiveSocket(userId) || getActiveSocket(String(userId));
-    
-    const contacts = await Contact.find({ 
-      $or: [{ userId: userId }, { adminId: userId }],
-      platform: 'whatsapp' 
-    });
+    const { ownerId, scope } = resolveOwner(req.user);
+    const activeSock = getActiveSocket(ownerId) || getActiveSocket(String(ownerId));
 
-    if (contacts.length === 0) {
+    const baseQuery = { $and: [scope, { platform: 'whatsapp' }] };
+    const totalWhatsApp = await Contact.countDocuments(baseQuery);
+
+    if (totalWhatsApp === 0) {
       return res.status(400).json({ success: false, message: "Verification ke liye koi WhatsApp contact maujood nahi hai." });
+    }
+
+    const pendingQuery = { $and: [scope, { platform: 'whatsapp' }, { waCheckedAt: null }] };
+    const pendingCount = await Contact.countDocuments(pendingQuery);
+    const alreadyCheckedCount = totalWhatsApp - pendingCount;
+
+    const emptyStats = { verifiedCount: 0, activeCount: 0, invalidCount: 0, failedCount: 0, alreadyCheckedCount, totalWhatsApp };
+
+    if (pendingCount === 0) {
+      return res.json({
+        success: true,
+        message: "Sab WhatsApp numbers pehle se check ho chuke hain. Koi naya number verify karne ke liye nahi hai.",
+        stats: emptyStats
+      });
+    }
+
+    // Official Meta Cloud API: number pehle se verify karne ka koi endpoint maujood nahi.
+    if (!activeSock) {
+      return res.json({
+        success: true,
+        skipped: true,
+        message: "Official WhatsApp Cloud API mein numbers ko pehle se verify nahi kiya ja sakta. Message bhejne par agar number WhatsApp par na ho to woh khud INVALID ho jayega.",
+        stats: emptyStats
+      });
     }
 
     let verifiedCount = 0;
     let activeCount = 0;
     let invalidCount = 0;
+    let failedCount = 0;
+    let consecutiveFailures = 0;
 
-    let configRecord = null;
-    if (WhatsAppConfig) {
-      configRecord = await WhatsAppConfig.findOne({ userId: userId, platform: { $in: ["whatsapp", "whatsapp_official"] } });
-    }
+    const cursor = Contact.find(pendingQuery).select('_id phone phoneNumber').lean().cursor();
 
-    // 1. Baileys QR Socket Bulk Verification
-    if (activeSock) {
-      for (const contact of contacts) {
-        const phone = contact.phone || contact.phoneNumber;
-        if (!phone) continue;
-        try {
-          const cleanPhone = phone.replace(/\D/g, '');
-          const [result] = await activeSock.onWhatsApp(cleanPhone);
-          
-          if (result && result.exists) {
-            contact.status = 'ACTIVE';
-            if (result.jid) contact.phone = result.jid.split('@')[0];
-            activeCount++;
-          } else {
-            contact.status = 'INVALID';
-            invalidCount++;
-          }
-          await contact.save();
-          verifiedCount++;
-        } catch (err) {
-          console.warn(`⚠️ Baileys onWhatsApp warning for ${phone}:`, err.message);
-          contact.status = 'INVALID';
-          invalidCount++;
-          await contact.save();
-          verifiedCount++;
-        }
-      }
-    } 
-    // 2. Official Meta Cloud API Bulk Verification
-    else if (configRecord && configRecord.phoneNumberId && configRecord.accessToken) {
-      const { phoneNumberId, accessToken } = configRecord;
-      const metaUrl = `https://graph.facebook.com/v20.0/${phoneNumberId}/contacts`;
+    for await (const contact of cursor) {
+      const phone = formatToInternationalPhone(contact.phone || contact.phoneNumber);
 
-      const chunkSize = 50;
-      for (let i = 0; i < contacts.length; i += chunkSize) {
-        const chunk = contacts.slice(i, i + chunkSize);
-        const phoneList = chunk.map(c => {
-          let p = c.phone || c.phoneNumber || '';
-          p = p.replace(/\D/g, '');
-          return p.startsWith('+') ? p : `+${p}`;
-        });
-
-        try {
-          const response = await axios.post(
-            metaUrl,
-            { blocking: 'wait', contacts: phoneList },
-            {
-              headers: {
-                Authorization: `Bearer ${accessToken}`,
-                'Content-Type': 'application/json'
-              },
-              timeout: 10000
-            }
-          );
-
-          const results = response.data?.contacts || [];
-          for (let j = 0; j < chunk.length; j++) {
-            const contact = chunk[j];
-            const cleanOriginal = (contact.phone || contact.phoneNumber || '').replace(/\D/g, '');
-            
-            const match = results.find(r => (r.input || '').replace(/\D/g, '') === cleanOriginal || (r.wa_id || '').replace(/\D/g, '') === cleanOriginal);
-
-            if (match && match.status === 'valid') {
-              contact.status = 'ACTIVE';
-              if (match.wa_id) contact.phone = match.wa_id;
-              activeCount++;
-            } else {
-              contact.status = 'INVALID';
-              invalidCount++;
-            }
-            await contact.save();
-            verifiedCount++;
-          }
-        } catch (metaErr) {
-          console.error("❌ Meta API bulk verification batch error:", metaErr.response?.data || metaErr.message);
-          for (const contact of chunk) {
-            contact.status = 'INVALID';
-            invalidCount++;
-            await contact.save();
-            verifiedCount++;
-          }
-        }
-      }
-    } 
-    else {
-      // Agar koi session active nahi hai toh strict check function run karein
-      for (const contact of contacts) {
-        const phone = contact.phone || contact.phoneNumber;
-        const check = await checkWhatsAppStatus(phone, userId);
-        contact.status = check.status;
-        if (check.status === 'ACTIVE') activeCount++;
-        else invalidCount++;
-        await contact.save();
+      if (!phone) {
+        await Contact.updateOne({ _id: contact._id }, { $set: { status: 'INVALID', waCheckedAt: new Date() } });
+        invalidCount++;
         verifiedCount++;
+        continue;
       }
+
+      try {
+        const [result] = await activeSock.onWhatsApp(phone);
+        consecutiveFailures = 0;
+
+        if (result && result.exists) {
+          const set = { status: 'ACTIVE', waCheckedAt: new Date() };
+          if (result.jid) {
+            const jidPhone = result.jid.split('@')[0];
+            set.phone = jidPhone;
+            set.recipientId = jidPhone;
+          }
+          await Contact.updateOne({ _id: contact._id }, { $set: set });
+          activeCount++;
+        } else {
+          await Contact.updateOne({ _id: contact._id }, { $set: { status: 'INVALID', waCheckedAt: new Date() } });
+          invalidCount++;
+        }
+        verifiedCount++;
+      } catch (err) {
+        // Temporary error ko INVALID nahi maante — contact unchecked rehta hai, agli dafa dobara check hoga
+        console.warn(`⚠️ Baileys onWhatsApp warning for ${phone}:`, err.message);
+        failedCount++;
+        consecutiveFailures++;
+        if (consecutiveFailures >= 5) {
+          console.error("❌ Verification roki gayi: lagatar 5 errors (socket disconnect ho sakta hai).");
+          break;
+        }
+      }
+
+      await sleep(120); // WhatsApp ko flood na karein
     }
 
+    const stoppedEarly = consecutiveFailures >= 5;
     return res.json({
       success: true,
-      message: `Verification Mukammal! Total Checked: ${verifiedCount} | Active WhatsApp: ${activeCount} | Invalid: ${invalidCount}`,
-      stats: { verifiedCount, activeCount, invalidCount }
+      message: stoppedEarly
+        ? `Verification beech mein ruk gayi (WhatsApp session mein masla). Checked: ${verifiedCount} | Baaqi unchecked hain, dobara click karein.`
+        : `Verification mukammal! Naye checked: ${verifiedCount} | Active: ${activeCount} | Invalid: ${invalidCount}` +
+          (failedCount ? ` | Check na ho sake: ${failedCount}` : '') +
+          (alreadyCheckedCount ? ` | Pehle se checked (skip): ${alreadyCheckedCount}` : ''),
+      stats: { verifiedCount, activeCount, invalidCount, failedCount, alreadyCheckedCount, totalWhatsApp }
     });
 
   } catch (err) {
@@ -336,9 +282,7 @@ router.get('/', auth, async (req, res) => {
 router.post('/add', auth, async (req, res) => {
   const { platform, name, phone, recipientId, facebookId, instagramId, group, tags, sourceAd } = req.body;
   try {
-    const userId = req.user.id || req.user._id;
-    const adminId = req.user.adminId || null;
-    const role = req.user.role ? req.user.role.toLowerCase() : 'admin';
+    const { userId, adminId, ownerId, role } = resolveOwner(req.user);
 
     let parsedTags = [];
     if (Array.isArray(tags)) {
@@ -371,15 +315,17 @@ router.post('/add', auth, async (req, res) => {
 
     let calculatedStatus = 'ACTIVE';
     let dpUrl = null;
+    let waCheckedAt = null;
 
     if (ids.platform === 'whatsapp' && ids.phone) {
-      const waCheck = await checkWhatsAppStatus(ids.phone, userId);
+      const waCheck = await checkWhatsAppStatus(ids.phone, ownerId);
       calculatedStatus = waCheck.status;
       ids.phone = waCheck.phone;
       ids.recipientId = waCheck.phone;
-      
-      if (calculatedStatus === 'ACTIVE') {
-        dpUrl = await fetchContactDp(ids.phone, userId);
+      if (waCheck.checked) waCheckedAt = new Date();
+
+      if (calculatedStatus === 'ACTIVE' && waCheck.checked) {
+        dpUrl = await fetchContactDp(ids.phone, ownerId);
       }
     }
 
@@ -396,16 +342,17 @@ router.post('/add', auth, async (req, res) => {
       group: selectedGroup,
       sourceAd: sourceAd || null,
       tags: parsedTags,
-      status: calculatedStatus
+      status: calculatedStatus,
+      waCheckedAt: waCheckedAt
     });
 
     const contact = await newContact.save();
 
     res.json({
       success: true,
-      message: calculatedStatus === 'ACTIVE'
-        ? "Contact saved successfully!"
-        : "Contact saved but marked as INVALID (Not on WhatsApp).",
+      message: calculatedStatus === 'INVALID'
+        ? "Contact saved but marked as INVALID (Not on WhatsApp)."
+        : "Contact saved successfully!",
       contact
     });
   } catch (err) {
@@ -416,8 +363,7 @@ router.post('/add', auth, async (req, res) => {
 
 router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) => {
   try {
-    const userId = req.user.id || req.user._id;
-    const adminId = req.user.adminId || null;
+    const { userId, adminId, ownerId } = resolveOwner(req.user);
     const defaultGroup = req.body.group || 'General Leads';
 
     if (!req.file) {
@@ -434,7 +380,7 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
       return res.status(400).json({ success: false, message: 'Excel sheet is empty.' });
     }
 
-    const formattedContactsPromises = excelRows.map(async (row) => {
+    const processRow = async (row) => {
       const rawName = String(row.Name || row.name || row['Contact Name'] || '').trim();
       const rawPlatform = String(row.Platform || row.platform || req.body.platform || 'whatsapp').toLowerCase().trim();
       
@@ -450,10 +396,10 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
       if (rawPlatform === 'whatsapp') {
         if (!rawName || !rawPhone) return null;
 
-        const waCheck = await checkWhatsAppStatus(rawPhone, userId);
+        const waCheck = await checkWhatsAppStatus(rawPhone, ownerId);
         let dpUrl = null;
-        if (waCheck.status === 'ACTIVE') {
-          dpUrl = await fetchContactDp(waCheck.phone, userId);
+        if (waCheck.status === 'ACTIVE' && waCheck.checked) {
+          dpUrl = await fetchContactDp(waCheck.phone, ownerId);
         }
 
         return {
@@ -467,7 +413,8 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
           group: row.Group || row.group || defaultGroup,
           sourceAd: row.SourceAd || row.sourceAd || null,
           tags: tagsArray,
-          status: waCheck.status
+          status: waCheck.status,
+          waCheckedAt: waCheck.checked ? new Date() : null
         };
       }
 
@@ -506,9 +453,15 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
       }
 
       return null;
-    });
+    };
 
-    const resolvedContacts = await Promise.all(formattedContactsPromises);
+    // Saari rows ek saath nahi — 5-5 ke batch mein (WhatsApp/DB par bojh kam)
+    const resolvedContacts = [];
+    const BATCH = 5;
+    for (let i = 0; i < excelRows.length; i += BATCH) {
+      const part = await Promise.all(excelRows.slice(i, i + BATCH).map(processRow));
+      resolvedContacts.push(...part);
+    }
     const validContacts = resolvedContacts.filter(Boolean);
 
     if (validContacts.length === 0) {

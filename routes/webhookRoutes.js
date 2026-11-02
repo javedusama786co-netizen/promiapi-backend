@@ -263,6 +263,46 @@ async function sendQrWhatsAppMessage(userId, to, messageText) {
   }
 }
 
+// 🟢 Delivery status se Contact ka WhatsApp status sync karta hai
+//  - failed + code 131026  -> number WhatsApp par nahi: INVALID
+//  - delivered / read      -> number WhatsApp par hai: ACTIVE + "checked"
+async function syncContactWaStatus(metaPhoneNumberId, recipientId, newStatus, errorCode) {
+  try {
+    const phone = recipientId ? String(recipientId).replace(/\D/g, "") : "";
+    if (!phone || !metaPhoneNumberId) return;
+    const isUndeliverable = newStatus === "failed" && Number(errorCode) === 131026;
+    const isDelivered = newStatus === "delivered" || newStatus === "read";
+    if (!isUndeliverable && !isDelivered) return;
+
+    const WA = mongoose.models.WhatsAppConfig;
+    if (!WA) return;
+    const cfg = await WA.findOne({ phoneNumberId: metaPhoneNumberId }).select("userId").lean();
+    if (!cfg || !cfg.userId) return;
+
+    const base = {
+      $and: [
+        { $or: [{ userId: cfg.userId }, { adminId: cfg.userId }] },
+        { $or: [{ phone: phone }, { recipientId: phone }] }
+      ],
+      platform: "whatsapp"
+    };
+
+    if (isUndeliverable) {
+      await Contact.updateMany(
+        { ...base, status: { $in: ["ACTIVE", "PENDING", "INVALID"] } },
+        { $set: { status: "INVALID", waCheckedAt: new Date() } }
+      );
+    } else {
+      await Contact.updateMany(
+        { ...base, status: { $in: ["ACTIVE", "PENDING", "INVALID"] }, $or: [{ waCheckedAt: null }, { status: "INVALID" }] },
+        { $set: { status: "ACTIVE", waCheckedAt: new Date() } }
+      );
+    }
+  } catch (e) {
+    console.warn("⚠️ syncContactWaStatus warning:", e.message);
+  }
+}
+
 // Turns a Meta send failure into a message the dashboard user can act on
 function describeMetaSendError(err) {
   const e = err?.response?.data?.error || {};
@@ -2165,6 +2205,13 @@ router.post("/", async (req, res) => {
                 );
               }
             }
+
+            await syncContactWaStatus(
+              changeValue.metadata?.phone_number_id,
+              statusObj.recipient_id,
+              newStatus,
+              Array.isArray(statusObj.errors) ? statusObj.errors[0]?.code : null
+            );
           }
         }
 
