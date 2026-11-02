@@ -14,6 +14,13 @@ const User = require("./models/User");
 require("./models/MetaConfig"); 
 require("./models/Order"); // 🟢 Fix: Order model yahan register kar diya hai taake MongoDB mein orders collection ban sakay
 
+// 🟢 Growth tools models (QR / Short Link / CTA / Widget / Click tracking) - indexes start se ban jayen
+require("./models/ClickEvent");
+require("./models/QRCode");
+require("./models/ShortLink");
+require("./models/CtaUrl");
+require("./models/WidgetConfig");
+
 // ROUTE IMPORTS
 const adminRoutes = require("./routes/adminRoutes");
 const analyticsRoute = require('./routes/analyticsRoute');
@@ -40,6 +47,9 @@ const chatRoutes = require("./routes/chatRoutes");
 const shortLinkRoutes = require("./routes/shortLinkRoutes");
 const ctaRoutes = require("./routes/ctaRoutes");
 const widgetRoutes = require("./routes/widgetRoutes");
+// 🟢 NEW: public (no-auth) tracking routes + detailed growth analytics
+const publicRoutes = require("./routes/publicRoutes");
+const growthAnalyticsRoutes = require("./routes/growthAnalyticsRoutes");
 
 // 🔗 Auto-Integration Routes Import
 const integrationRoutes = require("./routes/integrationRoutes");
@@ -80,8 +90,9 @@ app.use((req, res, next) => {
   next();
 });
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// 🟢 Limit 5mb: QR logo base64 image save hoti hai, default 100kb par "413 Payload Too Large" aata tha
+app.use(express.json({ limit: "5mb" }));
+app.use(express.urlencoded({ extended: true, limit: "5mb" }));
 
 // ==========================================
 // 🖼️ UPDATED: CROSS-ORIGIN STATIC MEDIA SERVING
@@ -218,10 +229,16 @@ app.use("/api/ecommerce", ecommerceRoutes);
 app.use("/api/qr", qrRoutes);
 app.use("/api/ai-bot", aiBotRoutes);
 app.use("/api/short-links", shortLinkRoutes);
-app.use("/", shortLinkRoutes); // Public redirect /s/:slug ke liye
 app.use("/api/cta-urls", ctaRoutes);
 app.use("/api/widgets", widgetRoutes);
-app.use("/", widgetRoutes); // /widget.js serve karne ke liye
+
+// 🟢 PUBLIC tracked routes (koi login nahi): /s/:slug, /c/:code, /widget.js,
+// /api/widgets/public/:key aur /api/widgets/event (widget beacon)
+app.use("/", publicRoutes);
+
+// 🟢 Detailed analytics (graphs, devices, countries, CSV export).
+// Alag path hai taake purane /api/analytics (analyticsRoute.js) se na takraye.
+app.use("/api/growth-analytics", growthAnalyticsRoutes);
 
 // 🟢 3. Tenant & Dynamic Specific Routes
 app.use("/api/tenant", tenantRoutes);
@@ -323,6 +340,25 @@ app.get('/api/whatsapp/qr', auth, (req, res) => {
 app.get("/", (req, res) => {
   res.send("Backend is running securely");
 }); 
+
+// ==========================================
+// 🟢 JSON ERROR HANDLERS (HTML error page ki jagah)
+// ==========================================
+app.use("/api", (req, res) => {
+  res.status(404).json({ success: false, message: `Route not found: ${req.method} ${req.originalUrl}` });
+});
+
+app.use((err, req, res, next) => {
+  if (res.headersSent) return next(err);
+  if (err.type === "entity.too.large") {
+    return res.status(413).json({ success: false, message: "Upload is too large. Use a smaller image (max 2 MB)." });
+  }
+  if (err.name === "MulterError" || err.message === "Only image files are allowed!") {
+    return res.status(400).json({ success: false, message: err.message });
+  }
+  console.error("Unhandled error:", err);
+  return res.status(err.status || 500).json({ success: false, message: err.message || "Server error" });
+});
 
 // Start server
 const PORT = process.env.PORT || 5000;
