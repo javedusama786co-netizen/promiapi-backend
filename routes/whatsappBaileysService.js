@@ -985,6 +985,19 @@ async function runAutomation(ctx, messageText, buttonPayloadId) {
 // =========================================================================
 // 📥 INBOUND MESSAGE HANDLER
 // =========================================================================
+// 👤 Read name + phone numbers out of a vCard string (contact shared by the customer)
+function parseVcardLite(vcard) {
+  const text = String(vcard || "");
+  const fn = (text.match(/^FN[^:\n]*:(.+)$/im) || [])[1];
+  const n = (text.match(/^N[^:\n]*:(.+)$/im) || [])[1];
+  const name = (fn || (n ? n.replace(/;+/g, " ") : "") || "").trim();
+  const phones = [];
+  const re = /^(?:item\d+\.)?TEL[^:\n]*:(.+)$/gim;
+  let m;
+  while ((m = re.exec(text)) !== null) phones.push(m[1].trim());
+  return { name, phones };
+}
+
 function extractIncoming(rawMessage) {
   let msgContent = rawMessage;
   try {
@@ -995,6 +1008,7 @@ function extractIncoming(rawMessage) {
   let messageText = "";
   let messageType = "text";
   let buttonPayloadId = "";
+  let extra = {}; // extra fields stored with the message (location / contacts / fileName)
 
   if (msgContent.conversation) {
     messageText = msgContent.conversation;
@@ -1029,10 +1043,40 @@ function extractIncoming(rawMessage) {
   } else if (msgContent.documentMessage) {
     messageText = msgContent.documentMessage.caption || msgContent.documentMessage.fileName || "[Document]";
     messageType = "document";
+    if (msgContent.documentMessage.fileName) extra.fileName = msgContent.documentMessage.fileName;
+  } else if (msgContent.stickerMessage) {
+    messageText = "[Sticker]";
+    messageType = "image";
+  } else if (msgContent.ptvMessage) {
+    messageText = "[Video Attachment]";
+    messageType = "video";
+  } else if (msgContent.locationMessage || msgContent.liveLocationMessage) {
+    // 📍 Location / Live location shared by the customer
+    const l = msgContent.locationMessage || msgContent.liveLocationMessage;
+    const isLive = Boolean(msgContent.liveLocationMessage);
+    const lat = Number(l.degreesLatitude);
+    const lng = Number(l.degreesLongitude);
+    const name = l.name || l.caption || "";
+    const address = l.address || "";
+    const mapUrl = `https://www.google.com/maps?q=${lat},${lng}`;
+    messageText = [isLive ? "📍 Live location" : "📍 Location", name, address, mapUrl].filter(Boolean).join("\n");
+    messageType = "location";
+    extra.location = { latitude: lat, longitude: lng, name, address, isLive, url: mapUrl };
+  } else if (msgContent.contactMessage || msgContent.contactsArrayMessage) {
+    // 👤 Contact card(s) shared by the customer
+    const list = msgContent.contactMessage ? [msgContent.contactMessage] : (msgContent.contactsArrayMessage.contacts || []);
+    const cards = list.map((c) => {
+      const parsed = parseVcardLite(c.vcard);
+      return { name: c.displayName || parsed.name || "Contact", phones: parsed.phones, vcard: c.vcard || "" };
+    });
+    // the raw vCard is kept in the text too, so the website can still draw the card even if the DB schema drops extra fields
+    messageText = list.map((c) => c.vcard).filter(Boolean).join("\n") || cards.map((c) => `👤 ${c.name}`).join("\n") || "[Contact]";
+    messageType = "contacts";
+    extra.contacts = cards;
   } else {
     messageText = "[Interactive Message]";
   }
-  return { msgContent, messageText, messageType, buttonPayloadId };
+  return { msgContent, messageText, messageType, buttonPayloadId, extra };
 }
 
 // 📥 INCOMING MEDIA (QR / Baileys): download the voice note / image / video / document from WhatsApp,
@@ -1058,7 +1102,7 @@ function extFromMime(mime = "", fallbackName = "") {
 
 async function saveInboundMedia(sock, msg, msgContent, messageType) {
   try {
-    const node = msgContent.audioMessage || msgContent.imageMessage || msgContent.videoMessage || msgContent.documentMessage;
+    const node = msgContent.audioMessage || msgContent.imageMessage || msgContent.videoMessage || msgContent.ptvMessage || msgContent.stickerMessage || msgContent.documentMessage;
     if (!node) return null;
 
     const buffer = await baileys.downloadMediaMessage(
@@ -1084,6 +1128,20 @@ async function saveInboundMedia(sock, msg, msgContent, messageType) {
   }
 }
 
+// 💾 Save an incoming message. If the schema rejects a newer type ("location" / "contacts"), store it as text:
+//    the text already carries the map link / vCard, so the website can still render it.
+async function saveChatMessageSafe(doc) {
+  try {
+    return await new ChatMessage(doc).save();
+  } catch (err) {
+    if (err && err.name === "ValidationError" && doc.type && doc.type !== "text") {
+      console.warn(`⚠️ ChatMessage type "${doc.type}" rejected by schema, saving as text:`, err.message);
+      return await new ChatMessage({ ...doc, type: "text" }).save();
+    }
+    throw err;
+  }
+}
+
 async function handleInboundMessage(sock, userId, msg) {
   if (!msg.message) return;
 
@@ -1102,7 +1160,7 @@ async function handleInboundMessage(sock, userId, msg) {
   const messageId = msg.key.id;
   const isFromMe = msg.key.fromMe;
 
-  const { msgContent, messageText, messageType, buttonPayloadId } = extractIncoming(msg.message);
+  const { msgContent, messageText, messageType, buttonPayloadId, extra } = extractIncoming(msg.message);
   if (msgContent.protocolMessage || msgContent.reactionMessage || msgContent.senderKeyDistributionMessage) return;
 
   if (isFromMe && botSentIds.has(messageId)) return;
@@ -1128,11 +1186,12 @@ async function handleInboundMessage(sock, userId, msg) {
       await dbContact.save();
     }
 
-    await new ChatMessage({
+    await saveChatMessageSafe({
       userId, messageId, customerPhone, customerName: dbContact?.name || customerPhone,
       platform: "whatsapp_qr", sender: "me", type: messageType, text: messageText, status: "sent", isBotMessage: false,
-      ...(inboundMediaUrl ? { mediaUrl: inboundMediaUrl } : {})
-    }).save();
+      ...(inboundMediaUrl ? { mediaUrl: inboundMediaUrl } : {}),
+      ...extra
+    });
     return;
   }
 
@@ -1152,11 +1211,12 @@ async function handleInboundMessage(sock, userId, msg) {
     );
   }
 
-  await new ChatMessage({
+  await saveChatMessageSafe({
     userId, messageId, customerPhone, customerName: dbContact?.name || profileName,
     platform: "whatsapp_qr", sender: "them", type: messageType, text: messageText, status: "unread",
-    ...(inboundMediaUrl ? { mediaUrl: inboundMediaUrl } : {})
-  }).save();
+    ...(inboundMediaUrl ? { mediaUrl: inboundMediaUrl } : {}),
+    ...extra
+  });
 
   const lastAgentMsg = await ChatMessage.findOne({
     userId, customerPhone, sender: "me",

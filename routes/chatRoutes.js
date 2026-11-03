@@ -946,6 +946,29 @@ router.post("/mark-read", authMiddleware, async (req, res) => {
   }
 });
 
+// ROUTE 5b: Voice note "listened" gateway - marks a voice message as played so the NEW indicator disappears
+router.post("/mark-played", authMiddleware, async (req, res) => {
+  try {
+    const { messageId, messageIds } = req.body;
+    const ids = (Array.isArray(messageIds) ? messageIds : [messageId]).filter((x) => x && mongoose.isValidObjectId(x));
+    if (!ids.length) {
+      return res.status(400).json({ success: false, message: "messageId is required." });
+    }
+
+    const businessScopeId = req.user.adminId || req.user.id || req.user._id;
+    const result = await ChatMessage.updateMany(
+      { $and: [{ $or: getAdminQueryFilter(businessScopeId) }, { _id: { $in: ids } }, { sender: "them" }] },
+      { $set: { voicePlayed: true, voicePlayedAt: new Date() } },
+      { strict: false } // works even if the ChatMessage schema has no voicePlayed field yet
+    );
+
+    return res.json({ success: true, modifiedCount: result.modifiedCount ?? result.nModified ?? 0 });
+  } catch (err) {
+    console.error("❌ Mark-played route crash:", err.message);
+    return res.status(500).json({ success: false, message: "Failed to mark voice note as played." });
+  }
+});
+
 // ROUTE 6: Get All Active Chat Threads (List View) with Archive & DP Support
 router.get("/", authMiddleware, async (req, res) => {
   try {
@@ -1005,6 +1028,7 @@ router.get("/", authMiddleware, async (req, res) => {
           _id: "$customerPhone",
           lastMessageId: { $first: "$_id" },
           lastMsg: { $first: "$text" },
+          lastType: { $first: "$type" },
           lastSender: { $first: "$sender" },
           lastMessageTimestamp: { $first: "$timestamp" },
           lastMessageStatus: { $first: "$status" },
@@ -1049,6 +1073,7 @@ router.get("/", authMiddleware, async (req, res) => {
       name: chat.customerName,
       customerName: chat.customerName,
       lastMsg: chat.lastMsg,
+      lastType: chat.lastType,
       lastSender: chat.lastSender,
       lastMessageTimestamp: chat.lastMessageTimestamp,
       lastMessageStatus: chat.lastMessageStatus,
