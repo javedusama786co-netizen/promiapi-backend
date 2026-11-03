@@ -8,6 +8,7 @@ const fs = require("fs");
 const ffmpeg = require("fluent-ffmpeg");
 const FormData = require("form-data");
 const ChatMessage = require("../models/ChatMessage");
+const QuickReply = require("../models/QuickReply");
 const Contact = require("../models/Contact");
 const TeamMember = require("../models/TeamMember");
 const AgentActivity = require("../models/AgentActivity");
@@ -1271,6 +1272,126 @@ router.get("/call-logs", authMiddleware, async (req, res) => {
   } catch (err) {
     console.error("❌ Fetch all call logs failed:", err.message);
     return res.status(500).json({ success: false, message: "Failed to load all call logs." });
+  }
+});
+
+// =========================================================================
+// QUICK REPLIES (saved message templates)
+// =========================================================================
+const isQuickReplyAdmin = (user) => {
+  const role = String(user.role || user.type || "").toLowerCase();
+  return ["admin", "owner", "superadmin", "manager", "administrator"].includes(role) || !!user.isAdmin;
+};
+
+const serializeQuickReply = (doc, user) => {
+  const plain = doc.toObject ? doc.toObject() : doc;
+  const me = String(user.id || user._id || "");
+  return { ...plain, canManage: isQuickReplyAdmin(user) || String(plain.createdBy || "") === me };
+};
+
+const cleanQuickReplyInput = (b = {}) => ({
+  title: String(b.title || "").trim(),
+  body: String(b.body || "").trim(),
+  category: String(b.category || "").trim()
+});
+
+const validateQuickReplyInput = ({ title, body, category }) => {
+  if (!title) return "Title is required.";
+  if (!body) return "Message is required.";
+  if (title.length > 80) return "Title can be at most 80 characters.";
+  if (category.length > 40) return "Category can be at most 40 characters.";
+  if (body.length > 4096) return "Message can be at most 4096 characters.";
+  return null;
+};
+
+// ROUTE: List quick replies for this business
+router.get("/quick-replies", authMiddleware, async (req, res) => {
+  try {
+    const businessScopeId = String(req.user.adminId || req.user.id || req.user._id);
+    const items = await QuickReply.find({ businessId: businessScopeId }).sort({ category: 1, title: 1 });
+    return res.json({ success: true, data: items.map((i) => serializeQuickReply(i, req.user)) });
+  } catch (err) {
+    console.error("❌ Fetch quick replies failed:", err.message);
+    return res.status(500).json({ success: false, message: "Failed to load quick replies." });
+  }
+});
+
+// ROUTE: Create a quick reply
+router.post("/quick-replies", authMiddleware, async (req, res) => {
+  try {
+    const businessScopeId = String(req.user.adminId || req.user.id || req.user._id);
+    const input = cleanQuickReplyInput(req.body);
+    const problem = validateQuickReplyInput(input);
+    if (problem) return res.status(400).json({ success: false, message: problem });
+
+    const created = await QuickReply.create({
+      ...input,
+      businessId: businessScopeId,
+      createdBy: String(req.user.id || req.user._id || "")
+    });
+    return res.status(201).json({ success: true, data: serializeQuickReply(created, req.user) });
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ success: false, message: "A quick reply with this title already exists." });
+    }
+    console.error("❌ Create quick reply failed:", err.message);
+    return res.status(500).json({ success: false, message: "Failed to save quick reply." });
+  }
+});
+
+// ROUTE: Update a quick reply (creator or admin only)
+router.put("/quick-replies/:id", authMiddleware, async (req, res) => {
+  try {
+    const businessScopeId = String(req.user.adminId || req.user.id || req.user._id);
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid quick reply id." });
+    }
+    const existing = await QuickReply.findOne({ _id: req.params.id, businessId: businessScopeId });
+    if (!existing) return res.status(404).json({ success: false, message: "Quick reply not found." });
+
+    const me = String(req.user.id || req.user._id || "");
+    if (!isQuickReplyAdmin(req.user) && String(existing.createdBy || "") !== me) {
+      return res.status(403).json({ success: false, message: "You can only edit your own quick replies." });
+    }
+
+    const input = cleanQuickReplyInput(req.body);
+    const problem = validateQuickReplyInput(input);
+    if (problem) return res.status(400).json({ success: false, message: problem });
+
+    existing.title = input.title;
+    existing.body = input.body;
+    existing.category = input.category;
+    await existing.save();
+    return res.json({ success: true, data: serializeQuickReply(existing, req.user) });
+  } catch (err) {
+    if (err.code === 11000) {
+      return res.status(409).json({ success: false, message: "A quick reply with this title already exists." });
+    }
+    console.error("❌ Update quick reply failed:", err.message);
+    return res.status(500).json({ success: false, message: "Failed to update quick reply." });
+  }
+});
+
+// ROUTE: Delete a quick reply (creator or admin only)
+router.delete("/quick-replies/:id", authMiddleware, async (req, res) => {
+  try {
+    const businessScopeId = String(req.user.adminId || req.user.id || req.user._id);
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: "Invalid quick reply id." });
+    }
+    const existing = await QuickReply.findOne({ _id: req.params.id, businessId: businessScopeId });
+    if (!existing) return res.status(404).json({ success: false, message: "Quick reply not found." });
+
+    const me = String(req.user.id || req.user._id || "");
+    if (!isQuickReplyAdmin(req.user) && String(existing.createdBy || "") !== me) {
+      return res.status(403).json({ success: false, message: "You can only delete your own quick replies." });
+    }
+
+    await existing.deleteOne();
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("❌ Delete quick reply failed:", err.message);
+    return res.status(500).json({ success: false, message: "Failed to delete quick reply." });
   }
 });
 
