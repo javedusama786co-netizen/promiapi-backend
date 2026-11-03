@@ -153,10 +153,15 @@ function convertToWhatsAppVoice(inputPath) {
     const outName = `voice-${Date.now()}-${Math.round(Math.random() * 1e9)}.ogg`;
     const outPath = path.join("uploads/", outName);
     ffmpeg(inputPath)
+      // 🔧 DURATION FIX: browser MediaRecorder .webm has no duration header and can carry timestamp
+      //    jumps. ffmpeg copied those jumps into the .ogg, so a 3-4s note became a 1-2 min file
+      //    (voice at the start, then silence). genpts + asetpts=N/SR/TB rebuilds continuous
+      //    timestamps from the real sample count, so the output length == the real audio length.
+      .inputOptions(["-fflags +genpts"])
       .noVideo()
+      .audioFilters("aresample=16000,asetpts=N/SR/TB")   // 16 kHz, same as WhatsApp's own voice notes
       .audioCodec("libopus")
       .audioChannels(1)
-      .audioFrequency(16000)   // same as WhatsApp's own voice notes
       .audioBitrate("24k")
       // NOTE: do NOT add "-application voip" / "-vbr on": files made with them play on
       // WhatsApp Web but fail on the mobile app ("audio not available").  Verified by A/B test.

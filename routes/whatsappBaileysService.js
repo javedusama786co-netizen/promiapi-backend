@@ -438,11 +438,15 @@ async function convertAudioToPttBuffer(inputPath) {
   
   await new Promise((resolve, reject) => {
     ffmpeg(inputPath)
+      // Same duration fix as chatRoutes.js: rebuild continuous timestamps so the .ogg is not stretched
+      .inputOptions(["-fflags +genpts"])
+      .noVideo()
+      .audioFilters("aresample=16000,asetpts=N/SR/TB")
       .toFormat("ogg")
       .audioCodec("libopus")
       .audioChannels(1)
-      .audioFrequency(16000)
       .audioBitrate("24k")
+      .outputOptions(["-map_metadata -1"])
       .on("end", () => resolve(targetOggPath))
       .on("error", (err) => reject(err))
       .save(targetOggPath);
@@ -485,8 +489,13 @@ async function sendMediaContent(sock, jid, mediaUrl, caption = "") {
       }
     }
 
+    if (!audioBuffer) {
+      // Conversion did not happen. Sending the raw file with an ogg/opus mimetype makes WhatsApp show
+      // "audio format wrong", so fail loudly instead of sending a broken voice note.
+      throw new Error("Voice note could not be converted to OGG/OPUS (check ffmpeg + libopus)");
+    }
     content = {
-      audio: audioBuffer ? audioBuffer : data,
+      audio: audioBuffer,
       mimetype: "audio/ogg; codecs=opus",
       ptt: true // 🔥 THIS IS THE KEY FIX: Ensures WhatsApp treats it as a Voice Note!
     };
