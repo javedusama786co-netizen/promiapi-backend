@@ -9,7 +9,7 @@ const Group = require('../models/Group');
 const auth = require('../middleware/auth');
 
 // ⚡ Centralized Baileys Service Import for DP fetching
-const { getActiveSocket } = require('../routes/whatsappBaileysService');
+const { getActiveSocket, fetchUserProfilePicture } = require('../routes/whatsappBaileysService');
 
 let WhatsAppConfig = mongoose.models.WhatsAppConfig || null;
 
@@ -65,8 +65,8 @@ async function fetchContactDp(phone, userId) {
     if (!activeSock) return null;
     const cleanPhone = String(phone || '').replace(/\D/g, '');
     const jid = `${cleanPhone}@s.whatsapp.net`;
-    const ppUrl = await activeSock.profilePictureUrl(jid, "image");
-    return ppUrl || null;
+    // permanent local copy (/uploads/dp-<phone>.jpg) instead of WhatsApp's expiring link
+    return (await fetchUserProfilePicture(activeSock, jid)) || null;
   } catch (err) {
     return null;
   }

@@ -1055,14 +1055,31 @@ router.get("/", authMiddleware, async (req, res) => {
     ]);
 
     const phonesList = chatAggregates.map(c => c._id);
+    // Contacts can belong to the admin or to an agent/admin pair, so match both (same scope as the chats above)
     const contactsData = await Contact.find({
-      userId: businessScopeId,
-      phone: { $in: phonesList }
-    }).lean();
+      $and: [
+        { $or: [{ userId: businessObjectId }, { adminId: businessObjectId }] },
+        { phone: { $in: phonesList } }
+      ]
+    }).select("phone profilePicUrl avatar").lean();
+
+    // Locally stored DPs ("/uploads/...") need the full server address, otherwise the browser looks for them
+    // on the website's own domain. Remote links are returned as they are (they must NOT go through the
+    // authenticated media-proxy, an <img> tag cannot send the login token).
+    const dpForFrontend = (url) => {
+      if (!url) return null;
+      const s = String(url);
+      if (s.startsWith("/uploads/") || s.startsWith("uploads/")) {
+        return `${PUBLIC_BASE_URL.replace(/\/$/, "")}${s.startsWith("/") ? s : `/${s}`}`;
+      }
+      return s;
+    };
 
     const contactMap = {};
     contactsData.forEach(cnt => {
-      contactMap[cnt.phone] = cnt.profilePicUrl || cnt.avatar || null;
+      const dp = dpForFrontend(cnt.profilePicUrl || cnt.avatar);
+      // several contact records can share a phone: never let an empty one overwrite a real DP
+      if (dp && !contactMap[cnt.phone]) contactMap[cnt.phone] = dp;
     });
 
     const chats = chatAggregates.map(chat => ({

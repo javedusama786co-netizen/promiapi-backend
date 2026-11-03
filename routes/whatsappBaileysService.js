@@ -47,14 +47,47 @@ function generateVerifyToken() {
   return "v_token_" + require("crypto").randomBytes(16).toString("hex");
 }
 
+// 🖼️ Profile picture: WhatsApp's own picture link (pps.whatsapp.net) is signed and EXPIRES within hours/days,
+// so saving only that link made every DP vanish from the chat list later. We now download the image once,
+// keep it in /uploads (dp-<phone>.jpg) and store that permanent path. If the download fails we fall back to
+// the live link so nothing is lost.
 const fetchUserProfilePicture = async (sock, jid) => {
     try {
         const ppUrl = await sock.profilePictureUrl(jid, "image");
-        return ppUrl || null;
+        if (!ppUrl) return null;
+
+        try {
+            const digits = String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
+            if (!digits) return ppUrl;
+            const resp = await axios.get(ppUrl, { responseType: "arraybuffer", timeout: 10000, maxContentLength: 5 * 1024 * 1024 });
+            const buf = Buffer.from(resp.data);
+            if (!buf.length) return ppUrl;
+            if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+            const fileName = `dp-${digits}.jpg`;
+            fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buf);
+            return `/uploads/${fileName}`;
+        } catch (dlErr) {
+            console.warn("⚠️ DP download failed, keeping remote link:", dlErr.message);
+            return ppUrl;
+        }
     } catch (err) {
         return null;
     }
 };
+
+// Retry throttle: customers who hide their photo must not cost one WhatsApp lookup per incoming message
+const dpLastTry = new Map();
+const DP_RETRY_MS = 6 * 60 * 60 * 1000;
+function shouldRefreshDp(userId, phone, contact) {
+    const current = contact && contact.profilePicUrl;
+    const needs = !current || /^https?:/i.test(String(current)); // missing, or old expiring remote link
+    if (!needs) return false;
+    const key = `${userId}:${phone}`;
+    const last = dpLastTry.get(key) || 0;
+    if (Date.now() - last < DP_RETRY_MS) return false;
+    dpLastTry.set(key, Date.now());
+    return true;
+}
 
 // 🟢 SMART MAPPING HELPER: Separates UI Clean Phone from Backend Technical remoteJid (LID/JID)
 async function resolveCleanCustomerPhone(sock, remoteJid, participant = null) {
@@ -1177,13 +1210,19 @@ async function handleInboundMessage(sock, userId, msg) {
   if (isFromMe) {
     let dbContact = await Contact.findOne({ userId, phone: customerPhone });
     if (!dbContact) {
+      const dpUrlOut = await fetchUserProfilePicture(sock, remoteJid);
       dbContact = await Contact.create({
         userId, name: customerPhone, phone: customerPhone, phoneNumber: customerPhone,
-        remoteJid: exactRemoteJid, platform: "whatsapp", group: "All", status: "ACTIVE"
+        remoteJid: exactRemoteJid, profilePicUrl: dpUrlOut, platform: "whatsapp", group: "All", status: "ACTIVE"
       });
-    } else if (!dbContact.remoteJid) {
-      dbContact.remoteJid = exactRemoteJid;
-      await dbContact.save();
+    } else {
+      const patch = {};
+      if (!dbContact.remoteJid) patch.remoteJid = exactRemoteJid;
+      if (shouldRefreshDp(userId, customerPhone, dbContact)) {
+        const dpFresh = await fetchUserProfilePicture(sock, remoteJid);
+        if (dpFresh) patch.profilePicUrl = dpFresh;
+      }
+      if (Object.keys(patch).length) await Contact.findOneAndUpdate({ _id: dbContact._id }, { $set: patch });
     }
 
     await saveChatMessageSafe({
@@ -1205,9 +1244,14 @@ async function handleInboundMessage(sock, userId, msg) {
       remoteJid: exactRemoteJid, profilePicUrl: dpUrl, platform: "whatsapp", group: "All", status: "ACTIVE", unreadCount: 1
     });
   } else {
+    const setOnExisting = { remoteJid: dbContact.remoteJid || exactRemoteJid };
+    if (shouldRefreshDp(userId, customerPhone, dbContact)) {
+      const dpFresh = await fetchUserProfilePicture(sock, remoteJid);
+      if (dpFresh) setOnExisting.profilePicUrl = dpFresh;
+    }
     await Contact.findOneAndUpdate(
       { _id: dbContact._id },
-      { $set: { remoteJid: dbContact.remoteJid || exactRemoteJid }, $inc: { unreadCount: 1, unread_count: 1 } }
+      { $set: setOnExisting, $inc: { unreadCount: 1, unread_count: 1 } }
     );
   }
 
@@ -1519,4 +1563,4 @@ const removeSession = (userId) => {
     if (qrCodesCache[userId]) qrCodesCache[userId] = null;
 };
 
-module.exports = { startWhatsAppSession, getQrCode, getActiveSocket, removeSession, sendQrWhatsAppMessage };
+module.exports = { startWhatsAppSession, getQrCode, getActiveSocket, removeSession, sendQrWhatsAppMessage, fetchUserProfilePicture };
