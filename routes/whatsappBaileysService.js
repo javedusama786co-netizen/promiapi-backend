@@ -51,33 +51,55 @@ function generateVerifyToken() {
 // so saving only that link made every DP vanish from the chat list later. We now download the image once,
 // keep it in /uploads (dp-<phone>.jpg) and store that permanent path. If the download fails we fall back to
 // the live link so nothing is lost.
-const fetchUserProfilePicture = async (sock, jid) => {
-    try {
-        const ppUrl = await sock.profilePictureUrl(jid, "image");
-        if (!ppUrl) return null;
+const fetchUserProfilePicture = async (sock, jid, phoneHint = "") => {
+    // Customers are often identified by a LID (xxxx@lid). WhatsApp refuses the picture lookup for LIDs,
+    // so we also try the plain phone JID, and the small "preview" size when the full image is not allowed.
+    const digits = String(phoneHint || String(jid || "").split("@")[0].split(":")[0]).replace(/\D/g, "");
+    const candidates = [];
+    if (jid) candidates.push(jid);
+    if (digits.length >= 7 && digits.length <= 15) {
+        const phoneJid = `${digits}@s.whatsapp.net`;
+        if (!candidates.includes(phoneJid)) candidates.push(phoneJid);
+    }
 
-        try {
-            const digits = String(jid || "").split("@")[0].split(":")[0].replace(/\D/g, "");
-            if (!digits) return ppUrl;
-            const resp = await axios.get(ppUrl, { responseType: "arraybuffer", timeout: 10000, maxContentLength: 5 * 1024 * 1024 });
-            const buf = Buffer.from(resp.data);
-            if (!buf.length) return ppUrl;
-            if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-            const fileName = `dp-${digits}.jpg`;
-            fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buf);
-            return `/uploads/${fileName}`;
-        } catch (dlErr) {
-            console.warn("⚠️ DP download failed, keeping remote link:", dlErr.message);
-            return ppUrl;
+    let ppUrl = null;
+    const reasons = [];
+    for (const candidate of candidates) {
+        for (const size of ["image", "preview"]) {
+            try {
+                const url = await sock.profilePictureUrl(candidate, size, 8000);
+                if (url) { ppUrl = url; break; }
+            } catch (err) {
+                reasons.push(`${candidate}/${size}: ${err?.message || err}`);
+            }
         }
-    } catch (err) {
+        if (ppUrl) break;
+    }
+
+    if (!ppUrl) {
+        console.log(`🖼️ [DP] ${digits || jid}: no picture available (${reasons[0] || "none returned"})`);
         return null;
+    }
+
+    try {
+        if (!digits) return ppUrl;
+        const resp = await axios.get(ppUrl, { responseType: "arraybuffer", timeout: 10000, maxContentLength: 5 * 1024 * 1024 });
+        const buf = Buffer.from(resp.data);
+        if (!buf.length) return ppUrl;
+        if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+        const fileName = `dp-${digits}.jpg`;
+        fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buf);
+        console.log(`🖼️ [DP] ${digits}: saved /uploads/${fileName}`);
+        return `/uploads/${fileName}`;
+    } catch (dlErr) {
+        console.warn(`⚠️ [DP] ${digits}: download failed, keeping remote link:`, dlErr.message);
+        return ppUrl;
     }
 };
 
 // Retry throttle: customers who hide their photo must not cost one WhatsApp lookup per incoming message
 const dpLastTry = new Map();
-const DP_RETRY_MS = 6 * 60 * 60 * 1000;
+const DP_RETRY_MS = 60 * 60 * 1000;
 function shouldRefreshDp(userId, phone, contact) {
     const current = contact && contact.profilePicUrl;
     const needs = !current || /^https?:/i.test(String(current)); // missing, or old expiring remote link
@@ -87,6 +109,43 @@ function shouldRefreshDp(userId, phone, contact) {
     if (Date.now() - last < DP_RETRY_MS) return false;
     dpLastTry.set(key, Date.now());
     return true;
+}
+
+// 🖼️ Background backfill: after the QR session connects, give a DP to the contacts that already exist but have none
+// (or still hold an old expiring link). Paced and capped so WhatsApp is never flooded.
+const dpBackfillRunning = new Set();
+async function backfillMissingDps(sock, userId) {
+    const key = String(userId);
+    if (dpBackfillRunning.has(key)) return;
+    dpBackfillRunning.add(key);
+    try {
+        const missing = await Contact.find({
+            $and: [
+                { $or: [{ userId: userId }, { adminId: userId }] },
+                { platform: "whatsapp" },
+                { status: { $ne: "INVALID" } },
+                { phone: { $nin: [null, ""] } },
+                { $or: [{ profilePicUrl: null }, { profilePicUrl: "" }, { profilePicUrl: { $exists: false } }, { profilePicUrl: /^https?:/i }] }
+            ]
+        }).select("_id phone profilePicUrl").limit(150).lean();
+
+        console.log(`🖼️ [DP] backfill started for ${missing.length} contact(s) without a permanent DP`);
+        let saved = 0;
+        for (const c of missing) {
+            if (!activeSessions[userId]) break; // session closed meanwhile
+            const digits = String(c.phone || "").replace(/\D/g, "");
+            if (!digits || !shouldRefreshDp(userId, digits, c)) continue;
+            const dp = await fetchUserProfilePicture(sock, `${digits}@s.whatsapp.net`, digits);
+            if (dp) {
+                await Contact.updateOne({ _id: c._id }, { $set: { profilePicUrl: dp } });
+                saved++;
+            }
+            await new Promise((r) => setTimeout(r, 2000));
+        }
+        console.log(`🖼️ [DP] backfill finished: ${saved} DP(s) saved`);
+    } finally {
+        dpBackfillRunning.delete(key);
+    }
 }
 
 // 🟢 SMART MAPPING HELPER: Separates UI Clean Phone from Backend Technical remoteJid (LID/JID)
@@ -132,13 +191,18 @@ async function resolveCleanCustomerPhone(sock, remoteJid, participant = null) {
 }
 
 // =========================================================================
-// 🔒 ROBUST SUBSCRIPTION VERIFICATION ENGINE
+// 🔒 AI SUBSCRIPTION / TOGGLE CHECK  (same rules as the Official Cloud API webhook)
 // =========================================================================
 async function verifyUserAiSubscription(userId) {
   if (!userId) return false;
   try {
     const settings = await AiBotSettings.findOne({ userId }).lean();
     if (settings) {
+      // ✅ No separate AI subscription in this system: the user just saves an API key and turns the AI toggle ON.
+      // (The old QR check ignored the toggle, which is why the AI never replied on QR.)
+      if (settings.openai?.enabled === true || settings.groq?.enabled === true) {
+        return true;
+      }
       if (settings.isAiSubscribed === true || settings.subscriptionActive === true || settings.isSubscribed === true) {
         return true;
       }
@@ -159,25 +223,68 @@ async function verifyUserAiSubscription(userId) {
       }
     }
   } catch (err) {
-    console.error("⚠️ Subscription Verification Error:", err?.message);
+    console.error("⚠️ [QR] Subscription Verification Error:", err?.message);
   }
+  console.log(`⛔ [QR AI SKIP] AI toggle is OFF (or no AiBotSettings saved) for user=${userId} - turn the AI toggle ON in the dashboard and save the API key.`);
   return false;
 }
 
+// ⏰ Operating hours (dashboard "Timing" setting) - AI replies only inside this window
+function isWithinOperatingHours(timing) {
+  if (!timing || !timing.enabled) return true;
+  if (!timing.startTime || !timing.endTime) return true;
+  try {
+    const tz = timing.timezone || "UTC";
+    const parts = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
+    const hour = parts.find((p) => p.type === "hour").value;
+    const minute = parts.find((p) => p.type === "minute").value;
+    const now = `${hour === "24" ? "00" : hour}:${minute}`;
+    return now >= timing.startTime && now <= timing.endTime;
+  } catch (e) {
+    console.error("⚠️ [QR] Timezone Evaluation Error:", e.message);
+    return true;
+  }
+}
+
+// ⏱ HUMAN-LIKE REPLY DELAY (dashboard "Simulated Typing Delay", seconds). Counts from the moment the customer's
+// message arrived, so it is a MINIMUM wait: if the AI already took 3s and the delay is 2s, we send immediately.
+async function waitReplyDelay(settings, startedAt) {
+  const sec = Number(settings?.advanced?.responseDelay) || 0;
+  if (sec <= 0) return;
+  const remaining = sec * 1000 - (Date.now() - (startedAt || Date.now()));
+  if (remaining > 0) {
+    console.log(`⏱ [QR REPLY DELAY] waiting ${(remaining / 1000).toFixed(1)}s (setting=${sec}s)`);
+    await new Promise((resolve) => setTimeout(resolve, remaining));
+  }
+}
+
+function formatToInternationalPhone(phoneStr) {
+  if (!phoneStr) return null;
+  let cleaned = String(phoneStr).replace(/\D/g, "");
+  if (cleaned.startsWith("9203") && cleaned.length === 12) {
+    cleaned = "92" + cleaned.substring(3);
+  } else if (cleaned.startsWith("03") && cleaned.length === 11) {
+    cleaned = "92" + cleaned.substring(1);
+  }
+  return cleaned;
+}
+
 // =========================================================================
-// 🔌 EXTERNAL CBS & TOOL EXECUTION ENGINE FOR QR
+// 🔌 EXTERNAL CBS & TOOL EXECUTION ENGINE (same as webhook)
 // =========================================================================
 async function fetchExternalCBSData(functionName, args, customerPhone, settings) {
   try {
+    console.log(`🌐 [QR TOOL EXECUTION] Function: ${functionName} | Customer: ${customerPhone}`);
+
     if (functionName === "get_customer_orders_status") {
       if (Order) {
-        const cleanPhone = String(customerPhone).replace(/\D/g, "");
-        const orders = await Order.find({ 
+        const cleanPhone = formatToInternationalPhone(customerPhone);
+        const orders = await Order.find({
           $or: [
             { customerPhone: cleanPhone },
             { customerPhone: customerPhone },
             { phone: cleanPhone }
-          ] 
+          ]
         }).sort({ createdAt: -1 }).limit(5).lean();
 
         if (orders && orders.length > 0) {
@@ -186,89 +293,271 @@ async function fetchExternalCBSData(functionName, args, customerPhone, settings)
       }
       return { status: "no_orders_found", message: "No recent orders found in system for this phone number." };
     }
-    return { status: "success", message: `Function ${functionName} executed successfully.` };
+
+    const externalApiConfig = settings?.externalApi || {};
+    const targetApiUrl = externalApiConfig.baseUrl || process.env.EXTERNAL_CBS_API_URL;
+    const apiSecretKey = externalApiConfig.apiKey || process.env.EXTERNAL_CBS_API_KEY;
+
+    if (targetApiUrl) {
+      const response = await axios.post(
+        targetApiUrl,
+        { functionName, customerPhone, parameters: args },
+        { headers: { Authorization: `Bearer ${apiSecretKey}`, "Content-Type": "application/json" }, timeout: 10000 }
+      );
+      return response.data;
+    }
+
+    // No external banking system configured: never invent balances / transactions for a real customer.
+    return { status: "unavailable", message: "This service is not available right now." };
   } catch (err) {
-    return { error: "Failed to connect to system server." };
+    console.error("❌ [QR] External Server Tool Execution Error:", err.response?.data || err.message);
+    return { error: "Failed to connect to external system server." };
   }
 }
 
 async function handleManualFunctionExecution(targetUserId, customerPhone, cleanKeyword, userSession) {
   try {
     const settings = await AiBotSettings.findOne({ userId: targetUserId });
-    let functionName = null;
-    const text = cleanKeyword.toLowerCase();
 
-    if (text.includes("balance") || text.includes("account") || text === "1") {
+    let functionName = null;
+    const text = String(cleanKeyword || "").toLowerCase();
+
+    if (text.includes("balance") || text.includes("account") || text === "1" || (userSession && userSession.currentStep === "BALANCE_CHECK")) {
       functionName = "get_bank_account_balance";
-    } else if (text.includes("order") || text.includes("tracking") || text.includes("status") || text === "2") {
+    } else if (text.includes("order") || text.includes("tracking") || text.includes("history") || text.includes("status") || text === "2" || (userSession && userSession.currentStep === "ORDER_HISTORY")) {
       functionName = "get_customer_orders_status";
+    } else if (text.includes("transaction") || text.includes("statement")) {
+      functionName = "get_transaction_history";
+    } else if (text.includes("block") || text.includes("card")) {
+      functionName = "block_credit_card";
+    } else if (text.includes("cheque") || text.includes("checkbook")) {
+      functionName = "request_cheque_book";
+    } else if (text.includes("loan") || text.includes("finance")) {
+      functionName = "apply_for_personal_loan";
     }
 
     if (functionName) {
       const data = await fetchExternalCBSData(functionName, {}, customerPhone, settings);
-      if (data && data.status === "success" && data.orders) {
-        let textReply = `📦 *Your Recent Orders (${data.count}):*\n\n`;
-        data.orders.forEach((ord, idx) => {
-          textReply += `${idx + 1}. ID: *${ord.orderId}* | Status: *${ord.status}* | RS ${ord.totalPrice}\n`;
-        });
-        return textReply;
-      } else if (data?.message) {
-        return `ℹ️ ${data.message}`;
+      if (data && data.status !== "unavailable") {
+        if (functionName === "get_bank_account_balance" && data.status === "success") {
+          return `🏦 *Bank Account Details*\n\nAccount: ${data.accountNumber}\nBalance: *${data.balance}*\nStatus: ${data.accountStatus}\nLast Tx: ${data.lastTransaction}`;
+        } else if (functionName === "get_customer_orders_status" && data.status === "success" && data.orders) {
+          let textReply = `📦 *Your Recent Orders (${data.count}):*\n\n`;
+          data.orders.forEach((ord, idx) => {
+            textReply += `${idx + 1}. ID: *${ord.orderId}* | Status: *${ord.status}* | RS ${ord.totalPrice}\n`;
+          });
+          return textReply;
+        } else if (data.message) {
+          return `ℹ️ ${data.message}`;
+        }
       }
     }
-  } catch (err) {}
+  } catch (err) {
+    console.error("❌ [QR] Manual Function Execution Error:", err.message);
+  }
   return null;
 }
 
 // =========================================================================
-// 🤖 FULLY PROFESSIONAL AI BOT & FLOWISE ENGINE FOR QR
+// 🤖 GROQ AI ENGINE FOR QR (same engine, prompt rules and tools as the Cloud API webhook; replaces OpenAI)
 // =========================================================================
+const GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions";
+// Override anytime with GROQ_MODEL in .env
+const GROQ_DEFAULT_MODEL = process.env.GROQ_MODEL || "openai/gpt-oss-120b";
+const GROQ_RETIRED_MODELS = {
+  "llama3-70b-8192": "openai/gpt-oss-120b",
+  "llama3-8b-8192": "openai/gpt-oss-20b",
+  "llama-3.1-70b-versatile": "openai/gpt-oss-120b",
+  "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
+  "llama-3.1-8b-instant": "openai/gpt-oss-20b",
+  "mixtral-8x7b-32768": "openai/gpt-oss-120b"
+};
+
+function resolveGroqModel(settings) {
+  const requested = String(settings?.groq?.model || settings?.openai?.model || settings?.aiModel || "").trim();
+  if (!requested) return GROQ_DEFAULT_MODEL;
+  if (GROQ_RETIRED_MODELS[requested]) {
+    console.warn(`⚠️ [QR GROQ] Model "${requested}" is retired on Groq -> using "${GROQ_RETIRED_MODELS[requested]}"`);
+    return GROQ_RETIRED_MODELS[requested];
+  }
+  // Old OpenAI model names saved in the panel (gpt-4o-mini etc.) do not exist on Groq
+  if (/^(gpt-|chatgpt|o1|o3|o4)/i.test(requested)) {
+    console.warn(`⚠️ [QR GROQ] "${requested}" is an OpenAI model name, not valid on Groq -> using "${GROQ_DEFAULT_MODEL}"`);
+    return GROQ_DEFAULT_MODEL;
+  }
+  return requested;
+}
+
+function resolveGroqApiKey(settings) {
+  const candidates = [
+    settings?.groq?.apiKey,
+    settings?.openai?.apiKey,
+    settings?.openaiApiKey,
+    settings?.groqApiKey,
+    process.env.GROQ_API_KEY
+  ];
+  for (const c of candidates) {
+    const key = String(c || "").replace(/^["']|["']$/g, "").trim();
+    if (key) return key;
+  }
+  return null;
+}
+
+function buildGroqTools(settings) {
+  const noParams = { type: "object", properties: {}, required: [] };
+  const tools = [
+    { type: "function", function: { name: "get_customer_orders_status", description: "Fetch real-time order status, courier tracking, and details from database for this customer.", parameters: noParams } }
+  ];
+  // Banking tools only when a real external CBS API is configured
+  const hasExternalApi = Boolean(settings?.externalApi?.baseUrl || process.env.EXTERNAL_CBS_API_URL);
+  if (hasExternalApi) {
+    tools.push(
+      { type: "function", function: { name: "get_bank_account_balance", description: "Fetch customer bank account balance, account number, and status from CBS.", parameters: noParams } },
+      { type: "function", function: { name: "get_transaction_history", description: "Fetch recent transaction history for customer bank account.", parameters: noParams } },
+      { type: "function", function: { name: "block_credit_card", description: "Block lost or stolen credit or debit card immediately.", parameters: noParams } },
+      { type: "function", function: { name: "request_cheque_book", description: "Order a new cheque book delivery for customer account.", parameters: noParams } },
+      { type: "function", function: { name: "apply_for_personal_loan", description: "Check personal loan eligibility and initiate new loan application.", parameters: noParams } },
+      { type: "function", function: { name: "get_forex_rates", description: "Get current live foreign exchange rates for currencies.", parameters: noParams } }
+    );
+  }
+  return tools;
+}
+
+// WhatsApp rejects very long text bodies. Keep a safe margin.
+const WA_MAX_REPLY_CHARS = 3800;
+function clampForWhatsApp(text) {
+  const s = String(text || "").trim();
+  if (s.length <= WA_MAX_REPLY_CHARS) return s;
+  const slice = s.slice(0, WA_MAX_REPLY_CHARS);
+  const cut = Math.max(slice.lastIndexOf("\n\n"), slice.lastIndexOf("\n"), slice.lastIndexOf(". "), slice.lastIndexOf("۔"));
+  return (cut > WA_MAX_REPLY_CHARS * 0.6 ? slice.slice(0, cut + 1) : slice).trim();
+}
+
+async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
+  const model = resolveGroqModel(settings);
+  const temperature = settings.groq?.temperature ?? settings.openai?.temperature ?? 0.7;
+  const systemPrompt = settings.groq?.systemPrompt || settings.openai?.systemPrompt || "You are a helpful customer support assistant on WhatsApp. Reply briefly and clearly in the customer's language.";
+
+  const waRules = "\n\nIMPORTANT RULES (WhatsApp channel):\n1. Answer ONLY what the customer asked in their latest message. Do NOT add extra details, other services, features or integrations they did not ask about.\n2. Never write one big paragraph. Use short lines separated by blank lines. For how-to questions use a numbered list (maximum 6 steps, one short line each). For other questions use 2-4 short sentences. Stay under 900 characters.\n3. If the question is broad (for example 'tell me your services' or 'details'), give a ONE-line overview and ask which specific thing they want to know more about.\n4. Do not repeat information that was already given earlier in the chat.\n5. Plain text only: no markdown tables, no # headings. Use *single asterisks* for bold, and '1.' or '-' for lists.\n6. Reply in the same language and script the customer writes in.\n7. Tone: polite, professional and friendly. Use at most one emoji. End with one short line offering further help.";
+  const messages = [{ role: "system", content: systemPrompt + waRules }];
+
+  // ChatMessage has NO createdAt field (only `timestamp`): sort by timestamp to get the most RECENT messages.
+  const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ timestamp: -1, _id: -1 }).limit(12).lean();
+  const history = chatHistory.reverse()
+    .map((m) => ({ role: m.sender === "me" ? "assistant" : "user", content: typeof m.text === "string" ? m.text.trim() : "" }))
+    .filter((m) => m.content); // Groq rejects empty message content
+
+  // The incoming message is usually already saved in DB -> avoid sending it twice
+  const lastHist = history[history.length - 1];
+  if (lastHist && lastHist.role === "user" && lastHist.content === String(userText || "").trim()) history.pop();
+  messages.push(...history);
+  messages.push({ role: "user", content: String(userText || "").trim() || "Hello" });
+
+  let tools = buildGroqTools(settings);
+  console.log(`🤖 [QR GROQ] Calling model=${model} | user=${userId} | customer=${customerPhone} | history=${history.length} | tools=${tools.length}`);
+
+  for (let round = 0; round < 3; round++) {
+    const body = { model, messages, temperature: Math.min(temperature, 0.5), max_tokens: 700 };
+    if (/gpt-oss/i.test(model)) body.reasoning_effort = "low"; // less hidden "thinking" tokens, faster replies
+    if (tools.length) { body.tools = tools; body.tool_choice = "auto"; }
+
+    let aiRes;
+    try {
+      aiRes = await axios.post(GROQ_API_URL, body, {
+        headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+        timeout: 30000
+      });
+    } catch (err) {
+      // Some Groq models occasionally fail tool-calling (400) -> retry once without tools
+      if (err.response?.status === 400 && tools.length) {
+        console.warn("⚠️ [QR GROQ] 400 with tools, retrying without tools:", JSON.stringify(err.response?.data));
+        tools = [];
+        continue;
+      }
+      console.error(`❌ [QR GROQ] Request failed | status=${err.response?.status || "no-response"} |`, JSON.stringify(err.response?.data) || err.message);
+      return null;
+    }
+
+    const msg = aiRes.data?.choices?.[0]?.message;
+    if (!msg) { console.error("❌ [QR GROQ] Empty response:", JSON.stringify(aiRes.data)); return null; }
+
+    if (msg.tool_calls && msg.tool_calls.length > 0) {
+      messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
+      for (const call of msg.tool_calls) {
+        let args = {};
+        try { args = JSON.parse(call.function?.arguments || "{}"); } catch (_) {}
+        const result = await fetchExternalCBSData(call.function.name, args, customerPhone, settings);
+        messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
+      }
+      continue;
+    }
+
+    const content = typeof msg.content === "string"
+      ? msg.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
+      : "";
+    if (content) {
+      console.log(`✅ [QR GROQ] Reply generated (${content.length} chars)`);
+      return clampForWhatsApp(content);
+    }
+    console.warn("⚠️ [QR GROQ] Model returned empty content");
+    return null;
+  }
+  return null;
+}
+
 async function processAiBotResponse(userId, customerPhone, userText) {
   try {
     const isSubscribed = await verifyUserAiSubscription(userId);
     if (!isSubscribed) return null;
 
     const settings = await AiBotSettings.findOne({ userId });
-    if (!settings) return null;
+    if (!settings) {
+      console.log(`⛔ [QR AI SKIP] No AiBotSettings document for user=${userId}`);
+      return null;
+    }
+
+    if (!isWithinOperatingHours(settings.timing)) {
+      console.log(`⛔ [QR AI SKIP] Outside operating hours for user=${userId}`);
+      return null;
+    }
+
+    // (the "Simulated Typing Delay" is applied right before sending, see waitReplyDelay)
 
     if (settings.flowise?.enabled && settings.flowise?.apiUrl) {
       try {
         const flowiseRes = await axios.post(
-          settings.flowise.apiUrl, 
+          settings.flowise.apiUrl,
           { question: userText },
-          { headers: { "Accept-Encoding": "gzip, deflate, br" }, decompress: true }
+          { timeout: 30000 }
         );
         const text = flowiseRes.data?.text || flowiseRes.data?.textResponse || flowiseRes.data;
         if (typeof text === "string" && text.trim()) {
           return text.trim();
         }
-      } catch (fErr) {}
-    }
-
-    if (settings.openai?.enabled && settings.openai?.apiKey) {
-      const messages = [];
-      if (settings.openai.systemPrompt) {
-        messages.push({ role: "system", content: settings.openai.systemPrompt });
+      } catch (fErr) {
+        console.error("❌ [QR] Flowise Request Failed:", fErr.message);
       }
-
-      const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ createdAt: -1 }).limit(10);
-      chatHistory.reverse().forEach((msg) => {
-        messages.push({ role: msg.sender === "me" ? "assistant" : "user", content: msg.text || "" });
-      });
-
-      messages.push({ role: "user", content: userText });
-
-      const openAiRes = await axios.post(
-        "https://api.openai.com/v1/chat/completions",
-        { model: settings.openai.model || "gpt-4o", messages, temperature: settings.openai.temperature ?? 0.7 },
-        { headers: { Authorization: `Bearer ${settings.openai.apiKey}`, "Content-Type": "application/json" } }
-      );
-
-      const finalReply = openAiRes.data?.choices?.[0]?.message?.content;
-      if (finalReply && finalReply.trim()) return finalReply.trim();
     }
-    return settings?.general?.failedMessage || null;
+
+    const aiEnabled = settings.openai?.enabled === true || settings.groq?.enabled === true;
+    const apiKey = resolveGroqApiKey(settings);
+
+    if (!aiEnabled) {
+      console.log(`⛔ [QR AI SKIP] AI toggle is OFF in settings (openai.enabled / groq.enabled) for user=${userId}`);
+    } else if (!apiKey) {
+      console.log(`⛔ [QR AI SKIP] No Groq API key found (checked groq.apiKey, openai.apiKey, openaiApiKey, GROQ_API_KEY env) for user=${userId}`);
+    } else {
+      const reply = await runGroqChat(userId, customerPhone, userText, settings, apiKey);
+      if (reply) return reply;
+    }
+
+    if (settings.general?.failedMessage) {
+      return settings.general.failedMessage;
+    }
+
+    return null;
   } catch (err) {
+    console.error("❌ [QR] AI Bot Engine Execution Crash:", err.message);
     return null;
   }
 }
@@ -354,7 +643,7 @@ function buildButtonsText(body, footer, buttons) {
   return out;
 }
 
-async function sendInteractiveButtons(sock, jid, body, footer, buttons) {
+async function sendInteractiveButtons(sock, jid, body, footer, buttons, headerMedia = null) {
   const { generateWAMessageFromContent, proto } = baileys;
   if (typeof generateWAMessageFromContent !== "function" || !proto?.Message?.InteractiveMessage) {
     throw new Error("Interactive buttons not supported by this Baileys version");
@@ -368,7 +657,9 @@ async function sendInteractiveButtons(sock, jid, body, footer, buttons) {
   const IM = proto.Message.InteractiveMessage;
   const interactiveMessage = IM.create({
     body: IM.Body.create({ text: body }),
-    header: IM.Header.create({ title: "", subtitle: "", hasMediaAttachment: false }),
+    header: headerMedia
+      ? IM.Header.create({ title: "", subtitle: "", hasMediaAttachment: true, ...headerMedia })
+      : IM.Header.create({ title: "", subtitle: "", hasMediaAttachment: false }),
     nativeFlowMessage: IM.NativeFlowMessage.create({ buttons: nfButtons }),
     ...(footer ? { footer: IM.Footer.create({ text: footer }) } : {})
   });
@@ -547,10 +838,64 @@ async function sendMediaContent(sock, jid, mediaUrl, caption = "") {
   return logs;
 }
 
+// 📦 ONE MESSAGE: media on top, text below it, buttons / options at the bottom.
+// Before, the media (with the text as caption) and the buttons went as two separate messages.
+//  - interactive mode: native-flow message with the image/video/document as its header (single message)
+//  - text / legacy mode: a single media message whose caption holds the text + the numbered options + links
+// Returns the log entries, or null when it cannot be combined (voice note, caption too long...) so the caller
+// can fall back to the old two-step sending.
+async function sendMediaWithButtons(sock, jid, { text = "", mediaUrl = "", buttons = [], footer = "", mode = BUTTONS_MODE }) {
+  const src = resolveMediaSource(mediaUrl);
+  if (!src) return null;
+  const kind = mediaKind(src.ext, src.clean);
+  if (kind === "audio") return null; // a voice note cannot carry a caption or buttons
+
+  const body = String(text || "").trim() || "Please select an option:";
+  const data = src.buffer ? src.buffer : { url: src.url };
+
+  if (mode === "interactive" && ["image", "video", "document"].includes(kind)) {
+    try {
+      if (typeof baileys.prepareWAMessageMedia === "function") {
+        const mediaInput = kind === "image" ? { image: data }
+          : kind === "video" ? { video: data }
+          : { document: data, mimetype: src.mimetype, fileName: src.fileName };
+        const prepared = await baileys.prepareWAMessageMedia(mediaInput, { upload: sock.waUploadToServer });
+        const sentInteractive = await sendInteractiveButtons(sock, jid, body, footer, buttons, prepared);
+        markBotSent(sentInteractive?.key?.id);
+        return [{ id: sentInteractive?.key?.id, type: "interactive", text: body, mediaUrl }];
+      }
+    } catch (e) {
+      console.error("⚠️ Interactive media+buttons failed, using single media message instead:", e.message);
+    }
+  }
+
+  const caption = buildButtonsText(body, footer, buttons);
+  if (caption.length > 1000) return null; // WhatsApp caption limit -> caller falls back to two messages
+
+  let content;
+  if (kind === "image") content = { image: data, caption };
+  else if (kind === "video") content = { video: data, caption };
+  else content = { document: data, mimetype: src.mimetype, fileName: src.fileName, caption };
+
+  const sent = await sock.sendMessage(jid, content);
+  markBotSent(sent?.key?.id);
+  return [{ id: sent?.key?.id, type: kind, text: caption, mediaUrl }];
+}
+
 async function sendBotPayload(sock, jid, { text = "", mediaUrl = "", buttons = [], footer = "" }) {
   const logs = [];
   const body = String(text || "").trim();
   let mediaSent = false;
+
+  // media + buttons => a single message (media, text and options together)
+  if (mediaUrl && buttons.length > 0) {
+    try {
+      const combinedLogs = await sendMediaWithButtons(sock, jid, { text: body, mediaUrl, buttons, footer });
+      if (combinedLogs) return combinedLogs;
+    } catch (e) {
+      console.error("⚠️ Single-message media+buttons failed, falling back to two messages:", e.message);
+    }
+  }
 
   if (mediaUrl) {
     try {
@@ -575,7 +920,7 @@ async function sendBotPayload(sock, jid, { text = "", mediaUrl = "", buttons = [
   return logs;
 }
 
-async function logBotMessages(ctx, logs, prefix) {
+async function logBotMessages(ctx, logs, prefix, origin = null) {
   for (const entry of logs) {
     try {
       await new ChatMessage({
@@ -589,6 +934,7 @@ async function logBotMessages(ctx, logs, prefix) {
         type: entry.type || "text",
         text: entry.text || "",
         mediaUrl: entry.mediaUrl || null,
+        ...(origin ? { origin } : {}),
         status: "sent"
       }).save();
     } catch (e) {
@@ -707,11 +1053,12 @@ async function runFlowChain(ctx, flow, startNode) {
     const content = extractNodeContent(node);
 
     if (content.text || content.mediaUrl || content.buttons.length) {
+      await waitReplyDelay(ctx.settings, ctx.startedAt);
       const logs = await sendBotPayload(sock, exactRemoteJid, content);
       if (logs.length) {
         sentAny = true;
         lastNode = node;
-        await logBotMessages(ctx, logs, "flow-qr");
+        await logBotMessages(ctx, logs, "flow-qr", "auto_reply");
       }
       if (content.buttons.length) {
         setPending(userId, customerPhone, { source: "flow", flowId: String(flow._id), nodeId: node.id, buttons: content.buttons });
@@ -845,6 +1192,7 @@ async function sendRuleReply(ctx, rule) {
     return false;
   }
 
+  await waitReplyDelay(ctx.settings, ctx.startedAt);
   const logs = await sendBotPayload(ctx.sock, ctx.exactRemoteJid, { text: finalMessageBody, mediaUrl, buttons, footer });
   if (!logs.length) return false;
 
@@ -852,7 +1200,7 @@ async function sendRuleReply(ctx, rule) {
   if (buttons.length) {
     setPending(ctx.userId, ctx.customerPhone, { source: "rule", ruleId: String(rule._id), buttons });
   }
-  await logBotMessages(ctx, logs, "bot-qr");
+  await logBotMessages(ctx, logs, "bot-qr", "auto_reply");
   return true;
 }
 
@@ -910,9 +1258,10 @@ async function runAutomation(ctx, messageText, buttonPayloadId) {
     const text = l.kind === "url"
       ? `🔗 *${btn.text}*\n${l.url}`
       : `📞 *${btn.text}*\n+${l.number}\n💬 WhatsApp: ${l.url}`;
+    await waitReplyDelay(ctx.settings, ctx.startedAt);
     const sent = await sock.sendMessage(exactRemoteJid, { text });
     markBotSent(sent?.key?.id);
-    await logBotMessages(ctx, [{ id: sent?.key?.id, type: "text", text }], "link-qr");
+    await logBotMessages(ctx, [{ id: sent?.key?.id, type: "text", text }], "link-qr", "auto_reply");
   };
 
   const applyRule = async (rule) => {
@@ -1002,15 +1351,19 @@ async function runAutomation(ctx, messageText, buttonPayloadId) {
   }
 
   if (!handled) {
+    console.log(`ℹ️ [QR BOT] no visual-flow / rule reply sent for "${cleanKeyword}" - trying AI / manual functions.`);
+    let replyOrigin = "auto_reply";
     let finalReplyText = await processAiBotResponse(userId, customerPhone, messageText);
+    if (finalReplyText) replyOrigin = "ai_reply";
     if (!finalReplyText) {
       finalReplyText = await handleManualFunctionExecution(userId, customerPhone, cleanKeyword, userSession);
     }
     if (finalReplyText) {
+      await waitReplyDelay(ctx.settings, ctx.startedAt);
       const sent = await sock.sendMessage(exactRemoteJid, { text: finalReplyText });
       markBotSent(sent?.key?.id);
       clearPending(userId, customerPhone);
-      await logBotMessages(ctx, [{ id: sent?.key?.id, type: "text", text: finalReplyText }], "ai-qr");
+      await logBotMessages(ctx, [{ id: sent?.key?.id, type: "text", text: finalReplyText }], "ai-qr", replyOrigin);
     }
   }
 }
@@ -1210,7 +1563,7 @@ async function handleInboundMessage(sock, userId, msg) {
   if (isFromMe) {
     let dbContact = await Contact.findOne({ userId, phone: customerPhone });
     if (!dbContact) {
-      const dpUrlOut = await fetchUserProfilePicture(sock, remoteJid);
+      const dpUrlOut = await fetchUserProfilePicture(sock, remoteJid, customerPhone);
       dbContact = await Contact.create({
         userId, name: customerPhone, phone: customerPhone, phoneNumber: customerPhone,
         remoteJid: exactRemoteJid, profilePicUrl: dpUrlOut, platform: "whatsapp", group: "All", status: "ACTIVE"
@@ -1219,7 +1572,7 @@ async function handleInboundMessage(sock, userId, msg) {
       const patch = {};
       if (!dbContact.remoteJid) patch.remoteJid = exactRemoteJid;
       if (shouldRefreshDp(userId, customerPhone, dbContact)) {
-        const dpFresh = await fetchUserProfilePicture(sock, remoteJid);
+        const dpFresh = await fetchUserProfilePicture(sock, remoteJid, customerPhone);
         if (dpFresh) patch.profilePicUrl = dpFresh;
       }
       if (Object.keys(patch).length) await Contact.findOneAndUpdate({ _id: dbContact._id }, { $set: patch });
@@ -1238,7 +1591,7 @@ async function handleInboundMessage(sock, userId, msg) {
 
   let dbContact = await Contact.findOne({ userId, phone: customerPhone });
   if (!dbContact) {
-    const dpUrl = await fetchUserProfilePicture(sock, remoteJid);
+    const dpUrl = await fetchUserProfilePicture(sock, remoteJid, customerPhone);
     dbContact = await Contact.create({
       userId, name: profileName, phone: customerPhone, phoneNumber: customerPhone,
       remoteJid: exactRemoteJid, profilePicUrl: dpUrl, platform: "whatsapp", group: "All", status: "ACTIVE", unreadCount: 1
@@ -1246,7 +1599,7 @@ async function handleInboundMessage(sock, userId, msg) {
   } else {
     const setOnExisting = { remoteJid: dbContact.remoteJid || exactRemoteJid };
     if (shouldRefreshDp(userId, customerPhone, dbContact)) {
-      const dpFresh = await fetchUserProfilePicture(sock, remoteJid);
+      const dpFresh = await fetchUserProfilePicture(sock, remoteJid, customerPhone);
       if (dpFresh) setOnExisting.profilePicUrl = dpFresh;
     }
     await Contact.findOneAndUpdate(
@@ -1255,9 +1608,15 @@ async function handleInboundMessage(sock, userId, msg) {
     );
   }
 
+  // Who owns this chat right now ("human" = handed over to an agent). Read BEFORE saving the new message.
+  const prevLatestMsg = await ChatMessage.findOne({ userId, customerPhone }).sort({ timestamp: -1, _id: -1 }).select("assignedTo").lean();
+  const currentAssignedContext = prevLatestMsg ? prevLatestMsg.assignedTo : null;
+  const botStartedAt = Date.now(); // the reply-delay setting counts from here
+
   await saveChatMessageSafe({
     userId, messageId, customerPhone, customerName: dbContact?.name || profileName,
     platform: "whatsapp_qr", sender: "them", type: messageType, text: messageText, status: "unread",
+    ...(currentAssignedContext ? { assignedTo: currentAssignedContext } : {}),
     ...(inboundMediaUrl ? { mediaUrl: inboundMediaUrl } : {}),
     ...extra
   });
@@ -1269,16 +1628,69 @@ async function handleInboundMessage(sock, userId, msg) {
 
   if (lastAgentMsg) {
     const lastAgentTime = new Date(lastAgentMsg.createdAt || lastAgentMsg.timestamp).getTime();
-    if ((Date.now() - lastAgentTime) / 60000 < 10) {
+    const COOLDOWN_MIN = Number(process.env.BOT_AGENT_COOLDOWN_MINUTES ?? 10);
+    if (COOLDOWN_MIN > 0 && (Date.now() - lastAgentTime) / 60000 < COOLDOWN_MIN) {
+      console.log(`⏸️ [QR BOT PAUSED] An agent/panel message was sent recently to ${customerPhone} (cool-down ${COOLDOWN_MIN} min) - bot will not reply. Set BOT_AGENT_COOLDOWN_MINUTES=0 to disable.`);
       return;
     }
   }
 
-  await runAutomation(
-    { sock, userId, customerPhone, exactRemoteJid, customerName: dbContact?.name || profileName },
-    messageText,
-    buttonPayloadId
-  );
+  // A shared location / contact card is not a typed command: never run keyword, handover or bot logic on it
+  const isShareOnly = messageType === "location" || messageType === "contacts";
+  const cleanKeyword = (!isShareOnly && messageText) ? messageText.trim().toLowerCase() : "";
+  const cleanButtonId = buttonPayloadId ? String(buttonPayloadId).trim().toLowerCase() : "";
+  if (!cleanKeyword && !cleanButtonId) return;
+
+  // 🚫 Unsubscribe / blocked contacts (same as the Cloud API)
+  let contactStatus = dbContact?.status;
+  if (cleanKeyword === "stop" || cleanKeyword === "unsubscribe") {
+    await Contact.updateOne({ _id: dbContact._id }, { $set: { status: "UNSUBSCRIBED" } });
+    contactStatus = "UNSUBSCRIBED";
+  }
+  if (contactStatus === "UNSUBSCRIBED" || contactStatus === "BLOCKED") {
+    console.log(`🚫 [QR BOT SKIPPED] ${customerPhone} is ${contactStatus}`);
+    return;
+  }
+
+  const botSettings = await AiBotSettings.findOne({ userId }).lean();
+
+  // 🙋 Hand over to a human: agent keyword in the message, or the chat is already with a human
+  const defaultHandoverKeywords = ["human", "agent", "representative", "support", "talk to human", "person", "admin"];
+  let handoverKeywords = [...defaultHandoverKeywords];
+  if (botSettings?.advanced?.handoverKeyword) {
+    handoverKeywords = handoverKeywords.concat(String(botSettings.advanced.handoverKeyword).split(",").map((k) => k.trim().toLowerCase()));
+  }
+  const isHandoverTriggered = handoverKeywords.some((kw) => kw && containsWord(cleanKeyword, kw));
+
+  if (isHandoverTriggered || currentAssignedContext === "human" || contactStatus === "ASSIGNED") {
+    console.log(`🙋 [QR BOT HANDED TO HUMAN] ${customerPhone} | keyword="${cleanKeyword}" | keywordHit=${isHandoverTriggered} | assignedTo=${currentAssignedContext} | contactStatus=${contactStatus}`);
+    await Contact.updateOne({ _id: dbContact._id }, { $set: { assignedTo: "human", status: "PENDING_AGENT" } });
+    await ChatMessage.updateOne({ userId, messageId }, { $set: { assignedTo: "human" } });
+    return;
+  }
+
+  // "typing..." while the bot works (only when a bot reply is likely)
+  let typingShown = false;
+  try {
+    const activeFlowCount = await BotFlow.countDocuments({ userId, isActive: true });
+    const botMayReply = activeFlowCount > 0 || botSettings?.openai?.enabled === true || botSettings?.groq?.enabled === true || botSettings?.flowise?.enabled === true;
+    if (botMayReply) {
+      await sock.sendPresenceUpdate("composing", exactRemoteJid);
+      typingShown = true;
+    }
+  } catch (e) { /* typing indicator is best-effort */ }
+
+  try {
+    await runAutomation(
+      { sock, userId, customerPhone, exactRemoteJid, customerName: dbContact?.name || profileName, settings: botSettings, startedAt: botStartedAt },
+      messageText,
+      buttonPayloadId
+    );
+  } finally {
+    if (typingShown) {
+      try { await sock.sendPresenceUpdate("paused", exactRemoteJid); } catch (e) { /* ignore */ }
+    }
+  }
 }
 
 // =========================================================================
@@ -1339,6 +1751,11 @@ const startWhatsAppSession = async (userId) => {
                         { $set: { status: "CONNECTED", qrCode: null, phoneNumber: userNumber, accessToken: "ACTIVE_SESSION" } },
                         { upsert: true }
                     );
+
+                    // existing contacts without a DP: fill them in the background (does not block the connection)
+                    setTimeout(() => {
+                        backfillMissingDps(sock, userId).catch((e) => console.warn("⚠️ [DP] backfill error:", e.message));
+                    }, 20000);
                 }
 
                 if (connection === "close") {
@@ -1457,6 +1874,16 @@ async function sendCampaignRichMessage(sock, jid, { header = "", text = "", foot
   const foot = String(footer || "").trim();
   const composed = [head ? `*${head}*` : "", body].filter(Boolean).join("\n\n");
   const logs = [];
+
+  // media + buttons => a single message (media, text and options together)
+  if (mediaUrl && buttons.length > 0) {
+    try {
+      const combinedLogs = await sendMediaWithButtons(sock, jid, { text: composed, mediaUrl, buttons, footer: foot, mode: CAMPAIGN_BUTTONS_MODE });
+      if (combinedLogs) return combinedLogs;
+    } catch (e) {
+      console.error("⚠️ Single-message campaign media+buttons failed, falling back to two messages:", e.message);
+    }
+  }
 
   let mediaSent = false;
   let captionUsed = false;
