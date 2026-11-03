@@ -838,6 +838,12 @@ async function sendMediaContent(sock, jid, mediaUrl, caption = "") {
   return logs;
 }
 
+// Native-button messages with a media HEADER are accepted by WhatsApp but the picture is often silently dropped
+// (text + buttons arrive, the image does not). So by default media + buttons go as ONE media message whose caption
+// carries the text + options (the picture is guaranteed). Set BAILEYS_MEDIA_HEADER_BUTTONS=true to try the
+// native-button-with-header variant instead.
+const MEDIA_HEADER_INTERACTIVE = String(process.env.BAILEYS_MEDIA_HEADER_BUTTONS || "false").toLowerCase() === "true";
+
 // 📦 ONE MESSAGE: media on top, text below it, buttons / options at the bottom.
 // Before, the media (with the text as caption) and the buttons went as two separate messages.
 //  - interactive mode: native-flow message with the image/video/document as its header (single message)
@@ -853,7 +859,7 @@ async function sendMediaWithButtons(sock, jid, { text = "", mediaUrl = "", butto
   const body = String(text || "").trim() || "Please select an option:";
   const data = src.buffer ? src.buffer : { url: src.url };
 
-  if (mode === "interactive" && ["image", "video", "document"].includes(kind)) {
+  if (MEDIA_HEADER_INTERACTIVE && mode === "interactive" && ["image", "video", "document"].includes(kind)) {
     try {
       if (typeof baileys.prepareWAMessageMedia === "function") {
         const mediaInput = kind === "image" ? { image: data }
@@ -879,6 +885,7 @@ async function sendMediaWithButtons(sock, jid, { text = "", mediaUrl = "", butto
 
   const sent = await sock.sendMessage(jid, content);
   markBotSent(sent?.key?.id);
+  console.log(`📦 [QR] ${kind} + text + ${buttons.length} option(s) sent as ONE message`);
   return [{ id: sent?.key?.id, type: kind, text: caption, mediaUrl }];
 }
 
