@@ -303,6 +303,71 @@ async function syncContactWaStatus(metaPhoneNumberId, recipientId, newStatus, er
   }
 }
 
+// =========================================================================
+// 📍👤 OFFICIAL CLOUD API: location + shared contact cards (same shape as the QR/Baileys service)
+// =========================================================================
+// Cloud API sends a contact as structured JSON (no vCard string). The QR service stores the raw vCard in
+// "text" and a parsed list in "contacts", so we rebuild a vCard here and the website draws both the same way.
+function buildVcardFromCloudContact(c) {
+  const clean = (v) => String(v == null ? "" : v).replace(/[\r\n]+/g, " ").trim();
+  const n = (c && c.name) || {};
+  const name = clean(n.formatted_name) || clean([n.first_name, n.middle_name, n.last_name].filter(Boolean).join(" ")) || "Contact";
+  const lines = ["BEGIN:VCARD", "VERSION:3.0", `FN:${name}`];
+  if (c && c.org && c.org.company) lines.push(`ORG:${clean(c.org.company)}`);
+  ((c && c.phones) || []).forEach((p) => {
+    const num = clean(p.phone || p.wa_id);
+    if (!num) return;
+    const type = clean(p.type || "CELL").toUpperCase();
+    lines.push(`TEL;type=${type}${p.wa_id ? `;waid=${clean(p.wa_id)}` : ""}:${num}`);
+  });
+  ((c && c.emails) || []).forEach((e) => { if (e && e.email) lines.push(`EMAIL:${clean(e.email)}`); });
+  lines.push("END:VCARD");
+  return lines.join("\n");
+}
+
+function parseCloudContacts(contactsArr) {
+  const list = Array.isArray(contactsArr) ? contactsArr : [];
+  const cards = list.map((c) => {
+    const vcard = buildVcardFromCloudContact(c);
+    const n = (c && c.name) || {};
+    const name = String(n.formatted_name || [n.first_name, n.last_name].filter(Boolean).join(" ") || "Contact").trim();
+    const phones = ((c && c.phones) || []).map((p) => String(p.phone || p.wa_id || "").trim()).filter(Boolean);
+    return { name, phones, vcard };
+  });
+  return {
+    cards,
+    text: cards.map((c) => c.vcard).join("\n") || "[Contact]"
+  };
+}
+
+function parseCloudLocation(loc) {
+  const lat = Number(loc && loc.latitude);
+  const lng = Number(loc && loc.longitude);
+  const name = String((loc && loc.name) || "").trim();
+  const address = String((loc && loc.address) || "").trim();
+  const mapUrl = `https://www.google.com/maps?q=${lat},${lng}`;
+  const text = ["📍 Location", name, address, mapUrl].filter(Boolean).join("\n");
+  return {
+    text,
+    location: { latitude: lat, longitude: lng, name, address, isLive: false, url: mapUrl }
+  };
+}
+
+// Save an incoming message. If the ChatMessage schema rejects a newer type ("location" / "contacts"),
+// store it as text: the text already carries the map link / vCard so the website can still render it.
+async function saveInboundChatSafe(chatDoc) {
+  try {
+    return await chatDoc.save();
+  } catch (err) {
+    if (err && err.name === "ValidationError" && chatDoc.type && chatDoc.type !== "text") {
+      console.warn(`⚠️ ChatMessage type "${chatDoc.type}" rejected by schema, saving as text:`, err.message);
+      chatDoc.type = "text";
+      return await chatDoc.save();
+    }
+    throw err;
+  }
+}
+
 // Turns a Meta send failure into a message the dashboard user can act on
 function describeMetaSendError(err) {
   const e = err?.response?.data?.error || {};
@@ -2233,6 +2298,7 @@ router.post("/", async (req, res) => {
           let extractedText = "";
           let buttonPayloadId = "";
           let mediaUrl = null;
+          let extraFields = {}; // location / contacts details stored with the message
 
           let referralData = null;
           if (messageData.referral) {
@@ -2282,6 +2348,16 @@ router.post("/", async (req, res) => {
             if (mediaId && accessToken) {
               mediaUrl = await downloadAndSaveMetaMedia(mediaId, accessToken, mediaObject?.mime_type || "");
             }
+          } else if (messageType === "location" && messageData.location) {
+            // 📍 Location shared by the customer
+            const parsedLoc = parseCloudLocation(messageData.location);
+            extractedText = parsedLoc.text;
+            extraFields.location = parsedLoc.location;
+          } else if (messageType === "contacts" && Array.isArray(messageData.contacts)) {
+            // 👤 Contact card(s) shared by the customer
+            const parsedCards = parseCloudContacts(messageData.contacts);
+            extractedText = parsedCards.text;
+            extraFields.contacts = parsedCards.cards;
           }
 
           if (!configRecord && !userId) {
@@ -2324,7 +2400,10 @@ router.post("/", async (req, res) => {
               currentUnread = dbContact.unreadCount || dbContact.unread_count || 1;
             }
 
-            const cleanKeyword = extractedText ? extractedText.trim().toLowerCase() : "";
+            // A shared location / contact card is not a typed command: its text (map link / vCard) must not
+            // trigger keyword, handover ("agent" in a contact name) or bot logic. It is just stored + blue-ticked.
+            const isShareOnly = Boolean(extraFields.location || extraFields.contacts);
+            const cleanKeyword = (!isShareOnly && extractedText) ? extractedText.trim().toLowerCase() : "";
             const cleanButtonId = buttonPayloadId ? buttonPayloadId.trim().toLowerCase() : "";
 
             if (cleanKeyword === "stop" || cleanKeyword === "unsubscribe") {
@@ -2349,9 +2428,10 @@ router.post("/", async (req, res) => {
                 text: finalStoredText,
                 mediaUrl: mediaUrl, 
                 referralData: referralData,
+                ...extraFields,
                 status: "unread"
               });
-              const savedMsg = await incomingChatLog.save();
+              const savedMsg = await saveInboundChatSafe(incomingChatLog);
               emitNewMessageNotification(req, savedMsg, currentUnread);
               return res.status(200).send("EVENT_RECEIVED_AND_BOT_BLOCKED");
             }
@@ -2401,10 +2481,11 @@ router.post("/", async (req, res) => {
               referralData: referralData,
               assignedTo: currentAssignedContext,
               ...(buttonPayloadId ? { buttonReply: { id: String(buttonPayloadId).split("::").pop(), title: extractedText } } : {}),
+              ...extraFields,
               status: "unread"
             });
 
-            const savedIncomingLog = await incomingChatLog.save();
+            const savedIncomingLog = await saveInboundChatSafe(incomingChatLog);
             emitNewMessageNotification(req, savedIncomingLog, currentUnread);
 
             // Media-only message (no text/button): bot logic below is skipped, so just give blue ticks here

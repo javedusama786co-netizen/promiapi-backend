@@ -45,7 +45,8 @@ const ChatMessageSchema = new mongoose.Schema({
   // 📸 Multi-Media, Interactive & Call Support
   type: {
     type: String,
-    enum: ["text", "image", "video", "audio", "document", "voice", "template", "interactive", "call"],
+    // "location" / "contacts": customer ne location ya contact card share kiya (QR + Cloud API dono)
+    enum: ["text", "image", "video", "audio", "document", "voice", "template", "interactive", "call", "location", "contacts"],
     default: "text"
   },
   mediaUrl: {
