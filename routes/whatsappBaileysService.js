@@ -1035,6 +1035,55 @@ function extractIncoming(rawMessage) {
   return { msgContent, messageText, messageType, buttonPayloadId };
 }
 
+// 📥 INCOMING MEDIA (QR / Baileys): download the voice note / image / video / document from WhatsApp,
+//    save it in /uploads and return its relative URL. Without this the message was stored as plain
+//    text ("[Voice Note]") with no mediaUrl, so the website had nothing to play.
+function extFromMime(mime = "", fallbackName = "") {
+  const m = String(mime).toLowerCase().split(";")[0].trim();
+  const map = {
+    "audio/ogg": ".ogg", "audio/opus": ".ogg", "audio/mpeg": ".mp3", "audio/mp4": ".m4a", "audio/aac": ".aac",
+    "audio/amr": ".amr", "audio/webm": ".webm", "audio/wav": ".wav", "audio/x-wav": ".wav",
+    "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/png": ".png", "image/webp": ".webp", "image/gif": ".gif",
+    "video/mp4": ".mp4", "video/3gpp": ".3gp", "video/quicktime": ".mov", "video/webm": ".webm",
+    "application/pdf": ".pdf", "application/msword": ".doc",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.ms-excel": ".xls",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+    "text/plain": ".txt"
+  };
+  if (map[m]) return map[m];
+  const fromName = path.extname(String(fallbackName || "")).toLowerCase();
+  return fromName || ".bin";
+}
+
+async function saveInboundMedia(sock, msg, msgContent, messageType) {
+  try {
+    const node = msgContent.audioMessage || msgContent.imageMessage || msgContent.videoMessage || msgContent.documentMessage;
+    if (!node) return null;
+
+    const buffer = await baileys.downloadMediaMessage(
+      msg,
+      "buffer",
+      {},
+      { logger: pino({ level: "silent" }), reuploadRequest: sock.updateMediaMessage }
+    );
+    if (!buffer || !buffer.length) return null;
+
+    // WhatsApp voice notes are OGG/OPUS. Force .ogg so the browser <audio> tag gets the right type.
+    const ext = (messageType === "voice" || messageType === "audio") && /ogg|opus/i.test(node.mimetype || "")
+      ? ".ogg"
+      : extFromMime(node.mimetype, node.fileName);
+
+    if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+    const fileName = `wa-in-${messageType}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buffer);
+    return `/uploads/${fileName}`;
+  } catch (err) {
+    console.error(`❌ [QR] Incoming ${messageType} download failed:`, err.message);
+    return null;
+  }
+}
+
 async function handleInboundMessage(sock, userId, msg) {
   if (!msg.message) return;
 
@@ -1061,6 +1110,12 @@ async function handleInboundMessage(sock, userId, msg) {
   const existingMsg = await ChatMessage.findOne({ userId, messageId });
   if (existingMsg) return;
 
+  // 📥 Download incoming voice / image / video / document so the website can actually play / show it
+  let inboundMediaUrl = null;
+  if (["voice", "audio", "image", "video", "document"].includes(messageType)) {
+    inboundMediaUrl = await saveInboundMedia(sock, msg, msgContent, messageType);
+  }
+
   if (isFromMe) {
     let dbContact = await Contact.findOne({ userId, phone: customerPhone });
     if (!dbContact) {
@@ -1075,7 +1130,8 @@ async function handleInboundMessage(sock, userId, msg) {
 
     await new ChatMessage({
       userId, messageId, customerPhone, customerName: dbContact?.name || customerPhone,
-      platform: "whatsapp_qr", sender: "me", type: messageType, text: messageText, status: "sent", isBotMessage: false
+      platform: "whatsapp_qr", sender: "me", type: messageType, text: messageText, status: "sent", isBotMessage: false,
+      ...(inboundMediaUrl ? { mediaUrl: inboundMediaUrl } : {})
     }).save();
     return;
   }
@@ -1098,7 +1154,8 @@ async function handleInboundMessage(sock, userId, msg) {
 
   await new ChatMessage({
     userId, messageId, customerPhone, customerName: dbContact?.name || profileName,
-    platform: "whatsapp_qr", sender: "them", type: messageType, text: messageText, status: "unread"
+    platform: "whatsapp_qr", sender: "them", type: messageType, text: messageText, status: "unread",
+    ...(inboundMediaUrl ? { mediaUrl: inboundMediaUrl } : {})
   }).save();
 
   const lastAgentMsg = await ChatMessage.findOne({
