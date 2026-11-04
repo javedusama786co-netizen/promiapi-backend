@@ -708,7 +708,7 @@ async function sendButtonsMessage(sock, jid, body, footer, buttons) {
 
 // ---------- MEDIA & VOICE NOTE CONVERSION ----------
 const MIME_BY_EXT = {
-  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".jfif": "image/jpeg", ".jpe": "image/jpeg", ".pjpeg": "image/jpeg", ".pjp": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
   ".mp4": "video/mp4", ".3gp": "video/3gpp", ".mov": "video/quicktime", ".mkv": "video/x-matroska", ".avi": "video/x-msvideo",
   ".mp3": "audio/mpeg", ".aac": "audio/aac", ".ogg": "audio/ogg; codecs=opus", ".opus": "audio/ogg; codecs=opus",
   ".wav": "audio/wav", ".m4a": "audio/mp4", ".webm": "audio/webm",
@@ -722,12 +722,29 @@ const MIME_BY_EXT = {
 };
 
 function mediaKind(ext, url = "") {
-  if ([".jpg", ".jpeg", ".png", ".webp", ".gif"].includes(ext)) return "image";
+  if ([".jpg", ".jpeg", ".jfif", ".jpe", ".pjpeg", ".pjp", ".png", ".webp", ".gif"].includes(ext)) return "image";
   if ([".mp4", ".3gp", ".mov", ".mkv", ".avi"].includes(ext)) return "video";
   if ([".mp3", ".aac", ".ogg", ".opus", ".wav", ".m4a", ".webm"].includes(ext)) return "audio";
   if (!ext && /image/i.test(url)) return "image";
   if (!ext && /video/i.test(url)) return "video";
   return "document";
+}
+
+function sniffMedia(b) {
+  if (!b || b.length < 12) return null;
+  const s = (a, z) => b.toString("latin1", a, z);
+  if (b[0] === 0xff && b[1] === 0xd8 && b[2] === 0xff) return { ext: ".jpg", mimetype: "image/jpeg" };
+  if (b[0] === 0x89 && s(1, 4) === "PNG") return { ext: ".png", mimetype: "image/png" };
+  if (s(0, 4) === "RIFF" && s(8, 12) === "WEBP") return { ext: ".webp", mimetype: "image/webp" };
+  if (s(0, 3) === "GIF") return { ext: ".gif", mimetype: "image/gif" };
+  if (s(4, 8) === "ftyp") {
+    const brand = s(8, 12);
+    if (/^(M4A |M4B |heic|heix|hevc|mif1|avif)/.test(brand)) return null; // audio / HEIC: keep extension-based handling
+    if (brand.startsWith("3gp")) return { ext: ".3gp", mimetype: "video/3gpp" };
+    if (brand.startsWith("qt")) return null;
+    return { ext: ".mp4", mimetype: "video/mp4" };
+  }
+  return null;
 }
 
 function resolveMediaSource(mediaUrl) {
@@ -757,7 +774,11 @@ function resolveMediaSource(mediaUrl) {
     for (const dir of dirs) {
       const localPath = path.join(dir, base);
       try {
-        if (fs.existsSync(localPath)) return { buffer: fs.readFileSync(localPath), localPath, ext, fileName, mimetype, clean };
+        if (fs.existsSync(localPath)) {
+          const buffer = fs.readFileSync(localPath);
+          const sn = sniffMedia(buffer);
+          return { buffer, localPath, ext: sn?.ext || ext, fileName, mimetype: sn?.mimetype || mimetype, clean };
+        }
       } catch (e) {}
     }
     console.warn(`⚠️ [QR BOT] media file "${base}" not found in ${dirs.join(" | ")} - will try to download ${clean}`);
