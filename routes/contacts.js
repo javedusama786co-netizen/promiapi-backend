@@ -44,6 +44,23 @@ function formatToInternationalPhone(phoneStr) {
 }
 
 
+// 🖼️ Profile pictures are now stored as "/uploads/dp-<phone>-<time>.jpg" (permanent copy in R2). A relative path in an
+// <img> tag would be looked up on the WEBSITE's domain and 404, so the API must return the full server address.
+const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.promiapi.com";
+function dpForFrontend(url) {
+  if (!url) return null;
+  const s = String(url);
+  if (s.startsWith("/uploads/") || s.startsWith("uploads/")) {
+    return `${PUBLIC_BASE_URL.replace(/\/$/, "")}${s.startsWith("/") ? s : `/${s}`}`;
+  }
+  return s;
+}
+function withAbsoluteDp(doc) {
+  const o = doc && typeof doc.toObject === "function" ? doc.toObject() : { ...doc };
+  if (o.profilePicUrl) o.profilePicUrl = dpForFrontend(o.profilePicUrl);
+  return o;
+}
+
 // 🟢 Owner / scope resolver — config aur QR socket hamesha admin (adminId || id) ke naam par hote hain
 function resolveOwner(user) {
   const userId = user.id || user._id;
@@ -272,7 +289,7 @@ router.get('/', auth, async (req, res) => {
     if (platform && platform !== 'All') query.platform = platform.toLowerCase();
 
     const contacts = await Contact.find(query).sort({ createdAt: -1 });
-    res.json({ success: true, contacts });
+    res.json({ success: true, contacts: contacts.map(withAbsoluteDp) });
   } catch (err) {
     console.error("Fetch Contacts Error:", err);
     res.status(500).json({ success: false, message: 'Server Error' });
@@ -353,7 +370,7 @@ router.post('/add', auth, async (req, res) => {
       message: calculatedStatus === 'INVALID'
         ? "Contact saved but marked as INVALID (Not on WhatsApp)."
         : "Contact saved successfully!",
-      contact
+      contact: withAbsoluteDp(contact)
     });
   } catch (err) {
     console.error("Single Add Error:", err);
@@ -504,7 +521,7 @@ router.patch('/:id/status', auth, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Contact not found or unauthorized' });
     }
 
-    res.json({ success: true, contact });
+    res.json({ success: true, contact: withAbsoluteDp(contact) });
   } catch (err) {
     console.error("Update Status Error:", err);
     res.status(500).json({ success: false, message: 'Failed to update status' });
@@ -530,7 +547,7 @@ router.patch('/:id/group', auth, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Contact not found or unauthorized' });
     }
 
-    res.json({ success: true, contact });
+    res.json({ success: true, contact: withAbsoluteDp(contact) });
   } catch (err) {
     console.error("Update Group Error:", err);
     res.status(500).json({ success: false, message: 'Failed to update contact group' });
@@ -552,7 +569,7 @@ router.patch('/:id/tags', auth, async (req, res) => {
       return res.status(404).json({ success: false, message: 'Contact not found or unauthorized' });
     }
 
-    res.json({ success: true, contact });
+    res.json({ success: true, contact: withAbsoluteDp(contact) });
   } catch (err) {
     console.error("Update Tags Error:", err);
     res.status(500).json({ success: false, message: 'Failed to update tags' });
