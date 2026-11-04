@@ -32,6 +32,17 @@ const Order = safeModel("Order", "../models/Order");
 // ⚙️ CONFIG
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.promiapi.com";
 const UPLOAD_DIR = path.join(__dirname, "../uploads");
+
+/** copy a file this service wrote into ./uploads to Cloudflare R2 under the same "/uploads/<fileName>" path
+ *  (Render's disk is wiped on every restart, so customer media / DPs would otherwise vanish) */
+async function mirrorToR2(localPath, fileName, contentType) {
+  if (!R2?.R2_ENABLED || typeof R2.putLocalFile !== "function") return;
+  try {
+    await R2.putLocalFile(localPath, `uploads/${fileName}`, contentType);
+  } catch (e) {
+    console.error(`⚠️ [R2] could not copy ${fileName} to R2:`, e.message);
+  }
+}
 const BUTTONS_MODE = String(process.env.BAILEYS_BUTTONS_MODE || "text").toLowerCase();
 const PENDING_TTL_MS = 2 * 60 * 60 * 1000;
 
@@ -91,8 +102,10 @@ const fetchUserProfilePicture = async (sock, jid, phoneHint = "") => {
         const buf = Buffer.from(resp.data);
         if (!buf.length) return ppUrl;
         if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-        const fileName = `dp-${digits}.jpg`;
+        // unique name: files are cached "immutable" in R2/browsers, so a refreshed DP needs a new URL
+        const fileName = `dp-${digits}-${Date.now()}.jpg`;
         fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buf);
+        await mirrorToR2(path.join(UPLOAD_DIR, fileName), fileName, "image/jpeg");
         console.log(`🖼️ [DP] ${digits}: saved /uploads/${fileName}`);
         return `/uploads/${fileName}`;
     } catch (dlErr) {
@@ -1601,6 +1614,7 @@ async function saveInboundMedia(sock, msg, msgContent, messageType) {
     if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
     const fileName = `wa-in-${messageType}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
     fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buffer);
+    await mirrorToR2(path.join(UPLOAD_DIR, fileName), fileName, node.mimetype || MIME_BY_EXT[ext] || "application/octet-stream");
     return `/uploads/${fileName}`;
   } catch (err) {
     console.error(`❌ [QR] Incoming ${messageType} download failed:`, err.message);

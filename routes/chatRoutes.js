@@ -133,6 +133,54 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage: storage });
 
+// ☁️ Cloudflare R2: Render's disk is wiped on every restart. Files that multer / ffmpeg write into ./uploads
+// (the sender still needs them on disk first) are copied to R2 under the SAME "/uploads/<name>" path, so the
+// stored URLs keep working after a restart (server serves "/uploads/*" from R2 when the file is not on disk).
+let r2 = { R2_ENABLED: false };
+try {
+  r2 = require("../middleware/upload");
+} catch (e) {
+  console.warn("⚠️ [R2] ../middleware/upload could not be loaded, using local /uploads only:", e.message);
+}
+const UPLOAD_MIME_BY_EXT = {
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
+  ".mp4": "video/mp4", ".3gp": "video/3gpp", ".mov": "video/quicktime",
+  ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg", ".aac": "audio/aac", ".m4a": "audio/mp4", ".wav": "audio/wav", ".webm": "audio/webm", ".amr": "audio/amr",
+  ".pdf": "application/pdf", ".txt": "text/plain", ".csv": "text/csv",
+  ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".ppt": "application/vnd.ms-powerpoint", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+};
+/** urlOrFile: "/uploads/<file>" (or a full URL to it) or just "<file>"; copies ./uploads/<file> to R2 */
+async function mirrorUploadToR2(urlOrFile, contentType) {
+  if (!r2.R2_ENABLED || typeof r2.putLocalFile !== "function" || !urlOrFile) return false;
+  try {
+    let p = String(urlOrFile).split("?")[0];
+    try { p = new URL(p).pathname; } catch (e) {}
+    const fileName = path.basename(decodeURIComponent(p));
+    const local = path.join("uploads", fileName);
+    if (!fs.existsSync(local)) return false;
+    const ct = contentType || UPLOAD_MIME_BY_EXT[path.extname(fileName).toLowerCase()] || "application/octet-stream";
+    await r2.putLocalFile(local, `uploads/${fileName}`, ct);
+    console.log(`☁️ [R2] saved uploads/${fileName}`);
+    return true;
+  } catch (e) {
+    console.error("⚠️ [R2] could not copy upload to R2:", e.message);
+    return false;
+  }
+}
+async function readUploadFromR2(link) {
+  if (!r2.R2_ENABLED || typeof r2.getObjectBuffer !== "function" || typeof r2.keyFromUrl !== "function") return null;
+  try {
+    const key = r2.keyFromUrl(link);
+    if (!key) return null;
+    return await r2.getObjectBuffer(key);
+  } catch (e) {
+    console.warn(`⚠️ [R2] could not read ${link} from R2: ${e.message}`);
+    return null;
+  }
+}
+
 function getMediaType(ext, mimeType) {
   const extension = ext ? ext.toLowerCase() : "";
   if ([".jpg", ".jpeg", ".png", ".gif", ".webp"].includes(extension) || mimeType?.includes("image")) {
@@ -666,6 +714,9 @@ router.post("/send", authMiddleware, upload.single("file"), async (req, res) => 
       archived: false,
       timestamp: new Date()
     });
+
+    // keep the uploaded file / converted voice note in R2 (local ./uploads is wiped on every restart)
+    if (mediaUrl) await mirrorUploadToR2(mediaUrl, req.file && !/voice|audio/i.test(calculatedMessageType) ? req.file.mimetype : undefined);
 
     await outboundLog.save();
 

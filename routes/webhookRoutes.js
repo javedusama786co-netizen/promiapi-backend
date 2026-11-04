@@ -68,6 +68,54 @@ const storage = multer.diskStorage({
 });
 const upload = multer({ storage: storage });
 
+// ☁️ Cloudflare R2: Render's disk is wiped on every restart. Files that multer / ffmpeg write into ./uploads
+// (the sender still needs them on disk first) are copied to R2 under the SAME "/uploads/<name>" path, so the
+// stored URLs keep working after a restart (server serves "/uploads/*" from R2 when the file is not on disk).
+let r2 = { R2_ENABLED: false };
+try {
+  r2 = require("../middleware/upload");
+} catch (e) {
+  console.warn("⚠️ [R2] ../middleware/upload could not be loaded, using local /uploads only:", e.message);
+}
+const UPLOAD_MIME_BY_EXT = {
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
+  ".mp4": "video/mp4", ".3gp": "video/3gpp", ".mov": "video/quicktime",
+  ".mp3": "audio/mpeg", ".ogg": "audio/ogg", ".opus": "audio/ogg", ".aac": "audio/aac", ".m4a": "audio/mp4", ".wav": "audio/wav", ".webm": "audio/webm", ".amr": "audio/amr",
+  ".pdf": "application/pdf", ".txt": "text/plain", ".csv": "text/csv",
+  ".doc": "application/msword", ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+  ".xls": "application/vnd.ms-excel", ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  ".ppt": "application/vnd.ms-powerpoint", ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+};
+/** urlOrFile: "/uploads/<file>" (or a full URL to it) or just "<file>"; copies ./uploads/<file> to R2 */
+async function mirrorUploadToR2(urlOrFile, contentType) {
+  if (!r2.R2_ENABLED || typeof r2.putLocalFile !== "function" || !urlOrFile) return false;
+  try {
+    let p = String(urlOrFile).split("?")[0];
+    try { p = new URL(p).pathname; } catch (e) {}
+    const fileName = path.basename(decodeURIComponent(p));
+    const local = path.join("uploads", fileName);
+    if (!fs.existsSync(local)) return false;
+    const ct = contentType || UPLOAD_MIME_BY_EXT[path.extname(fileName).toLowerCase()] || "application/octet-stream";
+    await r2.putLocalFile(local, `uploads/${fileName}`, ct);
+    console.log(`☁️ [R2] saved uploads/${fileName}`);
+    return true;
+  } catch (e) {
+    console.error("⚠️ [R2] could not copy upload to R2:", e.message);
+    return false;
+  }
+}
+async function readUploadFromR2(link) {
+  if (!r2.R2_ENABLED || typeof r2.getObjectBuffer !== "function" || typeof r2.keyFromUrl !== "function") return null;
+  try {
+    const key = r2.keyFromUrl(link);
+    if (!key) return null;
+    return await r2.getObjectBuffer(key);
+  } catch (e) {
+    console.warn(`⚠️ [R2] could not read ${link} from R2: ${e.message}`);
+    return null;
+  }
+}
+
 const WEBHOOK_VERIFY_TOKEN_FALLBACK = process.env.WEBHOOK_VERIFY_TOKEN || "usama_javed_secret_token_123";
 
 // Helper function to emit socket events for badge & sound effect
@@ -454,6 +502,8 @@ async function uploadMessengerAttachment(pageId, cleanToken, queryParams, mediaU
       if (fs.existsSync(localPath)) buffer = fs.readFileSync(localPath);
     }
   } catch (e) { /* not a URL */ }
+
+  if (!buffer) buffer = await readUploadFromR2(mediaUrl);
 
   if (!buffer) {
     const dl = await axios.get(mediaUrl, {
@@ -862,10 +912,15 @@ async function uploadMediaToMeta(phoneNumberId, accessToken, link) {
     let buffer;
     let source;
     const localFile = findLocalUploadFile(link);
+    // not on disk -> it lives in Cloudflare R2 (uploads made through the dashboard / bot reply / flow builder)
+    const r2Buffer = (localFile && fs.existsSync(localFile)) ? null : await readUploadFromR2(link);
     
     if (localFile && fs.existsSync(localFile)) {
       buffer = fs.readFileSync(localFile);
       source = `local:${localFile}`;
+    } else if (r2Buffer && r2Buffer.length) {
+      buffer = r2Buffer;
+      source = `r2:${link}`;
     } else {
       try {
         const dl = await axios.get(link, { 
@@ -1123,9 +1178,10 @@ async function downloadAndSaveMetaMedia(mediaId, accessToken, mimeType = "") {
     const fileName = `whatsapp-media-${Date.now()}-${Math.round(Math.random() * 1e4)}${ext}`;
     const filePath = path.join("uploads", fileName);
     fs.writeFileSync(filePath, Buffer.from(fileResponse.data));
+    await mirrorUploadToR2(fileName, detectedMime || undefined);
 
     const publicMediaUrl = `${PUBLIC_BASE_URL}/uploads/${fileName}`;
-    console.log(`✅ [MEDIA SAVED LOCALLY]: ${publicMediaUrl}`);
+    console.log(`✅ [MEDIA SAVED]: ${publicMediaUrl}`);
     return publicMediaUrl;
   } catch (err) {
     console.error("❌ Error downloading and saving Meta Media:", err.response?.data || err.message);
@@ -3417,6 +3473,9 @@ router.post("/send", upload.single("file"), async (req, res) => {
         return res.status(500).json({ success: false, error: "Voice note convert nahi ho saka (ffmpeg / libopus check karein)." });
       }
     }
+
+    // keep the uploaded file / converted voice note in R2 (local ./uploads is wiped on every restart)
+    if (req.file) await mirrorUploadToR2(req.file.filename, req.file.mimetype);
 
     if (platform === "whatsapp" && channelInfo.platformType === "QR") {
       // Agar aap QR / Baileys use kar rahe hain
