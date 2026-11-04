@@ -632,6 +632,7 @@ function normalizeButtons(raw, source = "flow", max = 10) {
 
 function buildButtonsText(body, footer, buttons) {
   let out = body ? `${body}\n\n` : "";
+  if (footer) out += `_${footer}_\n\n`;
   buttons.forEach((b, i) => {
     let line = `${NUM_EMOJI[i] || `${i + 1}.`} ${b.text}`;
     if (b.link?.kind === "url") line += `\n     🔗 ${b.link.url}`;
@@ -639,7 +640,6 @@ function buildButtonsText(body, footer, buttons) {
     out += line + "\n";
   });
   out += "\n_Reply with the number or option name_";
-  if (footer) out += `\n\n_${footer}_`;
   return out;
 }
 
@@ -868,7 +868,11 @@ async function sendMediaContent(sock, jid, mediaUrl, caption = "") {
 // carries the text + options (the picture is guaranteed). Set BAILEYS_MEDIA_HEADER_BUTTONS=true to try the
 // native-button-with-header variant instead.
 const MEDIA_HEADER_INTERACTIVE = String(process.env.BAILEYS_MEDIA_HEADER_BUTTONS || "false").toLowerCase() === "true";
-console.log(`⚙️ [QR BOT] buttons mode = ${BUTTONS_MODE} | media-header interactive = ${MEDIA_HEADER_INTERACTIVE} | PUBLIC_BASE_URL = ${PUBLIC_BASE_URL} | UPLOAD_DIR = ${UPLOAD_DIR}`);
+// "split"  = media + text as one message, then REAL native buttons (footer sits above the buttons) as a 2nd message
+// "single" = everything in one media message, options as a numbered text list
+// "auto"   = split when BAILEYS_BUTTONS_MODE=interactive, single otherwise
+const MEDIA_BUTTONS_LAYOUT = String(process.env.BAILEYS_MEDIA_BUTTONS_LAYOUT || "auto").toLowerCase();
+console.log(`⚙️ [QR BOT] media+buttons layout = ${MEDIA_BUTTONS_LAYOUT} | buttons mode = ${BUTTONS_MODE} | media-header interactive = ${MEDIA_HEADER_INTERACTIVE} | PUBLIC_BASE_URL = ${PUBLIC_BASE_URL} | UPLOAD_DIR = ${UPLOAD_DIR}`);
 
 // 📦 ONE MESSAGE: media on top, text below it, buttons / options at the bottom.
 // Before, the media (with the text as caption) and the buttons went as two separate messages.
@@ -920,8 +924,10 @@ async function sendBotPayload(sock, jid, { text = "", mediaUrl = "", buttons = [
   const body = String(text || "").trim();
   let mediaSent = false;
 
-  // media + buttons => a single message (media, text and options together)
-  if (mediaUrl && buttons.length > 0) {
+  // media + buttons => single message only when the layout asks for it (text menu); otherwise media first, then real buttons
+  const singleMessage = MEDIA_BUTTONS_LAYOUT === "single"
+    || (MEDIA_BUTTONS_LAYOUT !== "split" && (BUTTONS_MODE === "text" || MEDIA_HEADER_INTERACTIVE));
+  if (mediaUrl && buttons.length > 0 && singleMessage) {
     try {
       const combinedLogs = await sendMediaWithButtons(sock, jid, { text: body, mediaUrl, buttons, footer });
       if (combinedLogs) return combinedLogs;
