@@ -10,6 +10,10 @@ const WhatsAppConfig = require("../models/whatsappConfigModel");
 const axios = require("axios");
 const ffmpeg = require("fluent-ffmpeg"); // 🔥 FFmpeg imported for proper voice note conversion
 
+// ☁️ Cloudflare R2 helper (files uploaded from the dashboard live in the R2 bucket, not on Render's disk)
+let R2 = null;
+try { R2 = require("../middleware/upload"); } catch (e) { console.warn("ℹ️ [QR BOT] R2 helper not available:", e.message); }
+
 // 🌐 Safe Models Import for Bot, Flow & AI Integration
 function safeModel(name, file) {
   if (mongoose.models[name]) return mongoose.models[name];
@@ -781,6 +785,8 @@ function resolveMediaSource(mediaUrl) {
         }
       } catch (e) {}
     }
+    const r2Key = R2?.R2_ENABLED ? R2.keyFromUrl(clean) : "";
+    if (r2Key) return { r2Key, url: clean, ext, fileName, mimetype, clean };
     console.warn(`⚠️ [QR BOT] media file "${base}" not found in ${dirs.join(" | ")} - will try to download ${clean}`);
   }
   return { url: clean, ext, fileName, mimetype, clean };
@@ -790,6 +796,13 @@ function resolveMediaSource(mediaUrl) {
 // so a failure shows up here with a clear reason (404 / timeout / wrong host) instead of silently inside Baileys.
 async function loadMediaData(src) {
   if (src.buffer) return src.buffer;
+  if (src.r2Key && R2?.getObjectBuffer) {
+    try {
+      return await R2.getObjectBuffer(src.r2Key);
+    } catch (e) {
+      console.warn(`⚠️ [QR BOT] R2 read failed for "${src.r2Key}" (${e.name || e.message}) - trying the URL instead`);
+    }
+  }
   if (!/^https?:\/\//i.test(src.url || "")) {
     throw new Error(`Media path is not a valid URL and the file is not on disk: "${src.url}"`);
   }
@@ -856,6 +869,20 @@ async function sendMediaContent(sock, jid, mediaUrl, caption = "") {
         audioBuffer = await convertAudioToPttBuffer(src.localPath);
       } catch (err) {
         console.error("⚠️ Audio path conversion error:", err.message);
+      }
+    }
+
+    if (!audioBuffer && (src.r2Key || src.url)) {
+      let tmpFile;
+      try {
+        const raw = await loadMediaData(src);
+        tmpFile = path.join(require("os").tmpdir(), `ptt-${Date.now()}-${Math.round(Math.random() * 1e6)}${src.ext || ".bin"}`);
+        fs.writeFileSync(tmpFile, raw);
+        audioBuffer = await convertAudioToPttBuffer(tmpFile);
+      } catch (err) {
+        console.error("⚠️ Remote audio conversion error:", err.message);
+      } finally {
+        if (tmpFile) fs.unlink(tmpFile, () => {});
       }
     }
 

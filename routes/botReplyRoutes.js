@@ -52,19 +52,14 @@ const getBaseUrl = (req) =>
 // ==========================================
 // UPLOAD
 // ==========================================
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => {
-    const uniqueSuffix = Date.now() + "-" + Math.round(Math.random() * 1e9);
-    let ext = path.extname(file.originalname).toLowerCase();
-    if ([".jfif", ".jpe", ".pjpeg", ".pjp"].includes(ext)) ext = ".jpg"; // same JPEG data, a name WhatsApp understands
-    cb(null, file.fieldname + "-" + uniqueSuffix + ext);
-  },
-});
+// Files are stored in Cloudflare R2 (Render's disk is wiped on every restart).
+const { createUploader, urlPathOf, deleteFile, deleteByUrl } = require("../middleware/upload");
 
-const upload = multer({
-  storage,
-  limits: { fileSize: 100 * MB },
+const upload = createUploader({
+  folder: "bot-replies",
+  perUser: true,
+  prefix: "mediaFile",
+  maxSize: 100 * MB,
   fileFilter: (req, file, cb) => {
     if (mediaRuleFor(file.mimetype)) return cb(null, true);
     cb(new Error("Unsupported file type. Use JPG, PNG, WEBP, MP4, 3GP, MP3, OGG, AAC, AMR, PDF or Office files."));
@@ -90,7 +85,7 @@ const handleUpload = (req, res, next) => {
 };
 
 const discardUpload = (req) => {
-  if (req.file?.path) fs.unlink(req.file.path, () => {});
+  if (req.file) deleteFile(req.file);
 };
 
 /** Deletes an uploaded file only when no other rule still points at it. */
@@ -99,9 +94,7 @@ const cleanupMedia = async (mediaUrl) => {
   try {
     const stillUsed = await BotReply.exists({ mediaUrl });
     if (stillUsed) return;
-    const filename = path.basename(new URL(mediaUrl).pathname);
-    const filePath = path.join(uploadDir, filename);
-    if (filePath.startsWith(uploadDir)) fs.unlink(filePath, () => {});
+    await deleteByUrl(mediaUrl);
   } catch (e) {
     /* best effort */
   }
@@ -364,7 +357,7 @@ router.post("/", auth, handleUpload, async (req, res) => {
       replyText: String(body.replyText || "").trim(),
       footerText: isTemplate ? "" : String(body.footerText || "").trim(),
       templateId: isTemplate ? String(body.templateId || "").trim() : "",
-      mediaUrl: !isTemplate && req.file ? `${getBaseUrl(req)}/uploads/${req.file.filename}` : "",
+      mediaUrl: !isTemplate && req.file ? `${getBaseUrl(req)}${urlPathOf(req.file)}` : "",
       buttons: isTemplate ? [] : buttons,
     };
 
@@ -410,7 +403,7 @@ router.put("/:id", auth, handleUpload, async (req, res) => {
       const previousMedia = rule.mediaUrl;
 
       let mediaUrl = previousMedia || "";
-      if (req.file) mediaUrl = `${getBaseUrl(req)}/uploads/${req.file.filename}`;
+      if (req.file) mediaUrl = `${getBaseUrl(req)}${urlPathOf(req.file)}`;
       else if (removeMedia) mediaUrl = "";
       if (isTemplate) mediaUrl = "";
 

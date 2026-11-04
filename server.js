@@ -104,6 +104,9 @@ app.use("/uploads", (req, res, next) => {
   next();
 }, express.static(path.join(__dirname, "uploads")));
 
+// ☁️ Files that are not on the local disk are served from Cloudflare R2 (same "/uploads/..." links as before)
+app.use("/uploads", require("./middleware/upload").serveFromR2);
+
 // Database Connection
 connectDB();
 

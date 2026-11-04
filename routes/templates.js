@@ -2,6 +2,7 @@ const express = require("express");
 const router = express.Router();
 const auth = require("../middleware/auth");
 const axios = require("axios");
+const r2 = require("../middleware/upload"); // Cloudflare R2 helper
 const multer = require("multer");
 const path = require("path");
 const fs = require("fs");
@@ -376,6 +377,13 @@ router.post("/", auth, upload.single("media"), async (req, res) => {
     let dynamicMediaUrl = "";
     if (req.file) {
       dynamicMediaUrl = `https://api.promiapi.com/uploads/templates/${req.file.filename}`;
+      // Keep a durable copy in Cloudflare R2 (the local copy is still used for the Meta upload below,
+      // but Render's disk is wiped on every restart). The URL above is served from R2 by server.js.
+      try {
+        await r2.putLocalFile(req.file.path, `uploads/templates/${req.file.filename}`, req.file.mimetype);
+      } catch (e) {
+        console.error("⚠️ Template media R2 copy failed:", e.message);
+      }
     }
 
     const savedTemplate = await Template.create({
