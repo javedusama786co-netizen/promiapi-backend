@@ -733,6 +733,10 @@ function mediaKind(ext, url = "") {
 function resolveMediaSource(mediaUrl) {
   if (!mediaUrl) return null;
   let clean = String(mediaUrl).trim();
+  // relative values like "uploads/x.jpg" or just "x.jpg" -> make them "/uploads/x.jpg"
+  if (!/^https?:\/\//i.test(clean) && !clean.startsWith("/")) {
+    clean = /^uploads\//i.test(clean) ? "/" + clean : "/uploads/" + clean;
+  }
   if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i.test(clean)) {
     clean = clean.replace(/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?/i, PUBLIC_BASE_URL);
   } else if (clean.startsWith("/uploads/")) {
@@ -748,12 +752,33 @@ function resolveMediaSource(mediaUrl) {
   const mimetype = MIME_BY_EXT[ext] || "application/octet-stream";
 
   if (pathname.includes("/uploads/")) {
-    const localPath = path.join(UPLOAD_DIR, path.basename(pathname));
-    try {
-      if (fs.existsSync(localPath)) return { buffer: fs.readFileSync(localPath), localPath, ext, fileName, mimetype, clean };
-    } catch (e) {}
+    const base = path.basename(pathname);
+    const dirs = [UPLOAD_DIR, path.join(process.cwd(), "uploads")];
+    for (const dir of dirs) {
+      const localPath = path.join(dir, base);
+      try {
+        if (fs.existsSync(localPath)) return { buffer: fs.readFileSync(localPath), localPath, ext, fileName, mimetype, clean };
+      } catch (e) {}
+    }
+    console.warn(`⚠️ [QR BOT] media file "${base}" not found in ${dirs.join(" | ")} - will try to download ${clean}`);
   }
   return { url: clean, ext, fileName, mimetype, clean };
+}
+
+// Always hand Baileys a real Buffer. If the file is not on this server's disk we download it ourselves,
+// so a failure shows up here with a clear reason (404 / timeout / wrong host) instead of silently inside Baileys.
+async function loadMediaData(src) {
+  if (src.buffer) return src.buffer;
+  if (!/^https?:\/\//i.test(src.url || "")) {
+    throw new Error(`Media path is not a valid URL and the file is not on disk: "${src.url}"`);
+  }
+  try {
+    const r = await axios.get(src.url, { responseType: "arraybuffer", timeout: 20000, maxContentLength: 100 * 1024 * 1024 });
+    return Buffer.from(r.data);
+  } catch (e) {
+    const status = e.response?.status ? `HTTP ${e.response.status}` : e.code || e.message;
+    throw new Error(`Media download failed (${status}) from ${src.url}`);
+  }
 }
 
 // 🔥 HELPER: CONVERT AUDIO / WEBM / OGG TO PTT (OPUS/OGG) USING FFMPEG FOR TRUE WHATSAPP VOICE NOTE
@@ -785,7 +810,7 @@ async function sendMediaContent(sock, jid, mediaUrl, caption = "") {
   const src = resolveMediaSource(mediaUrl);
   if (!src) return null;
   const kind = mediaKind(src.ext, src.clean);
-  let data = src.buffer ? src.buffer : { url: src.url };
+  const data = kind === "audio" ? null : await loadMediaData(src);
   let content;
 
   if (kind === "image") {
@@ -843,6 +868,7 @@ async function sendMediaContent(sock, jid, mediaUrl, caption = "") {
 // carries the text + options (the picture is guaranteed). Set BAILEYS_MEDIA_HEADER_BUTTONS=true to try the
 // native-button-with-header variant instead.
 const MEDIA_HEADER_INTERACTIVE = String(process.env.BAILEYS_MEDIA_HEADER_BUTTONS || "false").toLowerCase() === "true";
+console.log(`⚙️ [QR BOT] buttons mode = ${BUTTONS_MODE} | media-header interactive = ${MEDIA_HEADER_INTERACTIVE} | PUBLIC_BASE_URL = ${PUBLIC_BASE_URL} | UPLOAD_DIR = ${UPLOAD_DIR}`);
 
 // 📦 ONE MESSAGE: media on top, text below it, buttons / options at the bottom.
 // Before, the media (with the text as caption) and the buttons went as two separate messages.
@@ -857,7 +883,7 @@ async function sendMediaWithButtons(sock, jid, { text = "", mediaUrl = "", butto
   if (kind === "audio") return null; // a voice note cannot carry a caption or buttons
 
   const body = String(text || "").trim() || "Please select an option:";
-  const data = src.buffer ? src.buffer : { url: src.url };
+  const data = await loadMediaData(src);
 
   if (MEDIA_HEADER_INTERACTIVE && mode === "interactive" && ["image", "video", "document"].includes(kind)) {
     try {
@@ -900,7 +926,7 @@ async function sendBotPayload(sock, jid, { text = "", mediaUrl = "", buttons = [
       const combinedLogs = await sendMediaWithButtons(sock, jid, { text: body, mediaUrl, buttons, footer });
       if (combinedLogs) return combinedLogs;
     } catch (e) {
-      console.error("⚠️ Single-message media+buttons failed, falling back to two messages:", e.message);
+      console.error("⚠️ Single-message media+buttons failed, falling back to two messages:", mediaUrl, "->", e.message);
     }
   }
 
@@ -909,7 +935,7 @@ async function sendBotPayload(sock, jid, { text = "", mediaUrl = "", buttons = [
       const mediaLogs = await sendMediaContent(sock, jid, mediaUrl, body);
       if (mediaLogs) { logs.push(...mediaLogs); mediaSent = true; }
     } catch (e) {
-      console.error("❌ Bot media send failed:", e.message);
+      console.error("❌ Bot media send failed:", mediaUrl, "->", e.message);
     }
   }
 
@@ -1199,6 +1225,7 @@ async function sendRuleReply(ctx, rule) {
     return false;
   }
 
+  console.log(`🤖 [QR BOT] rule ${rule._id} type=${rule.botType} template=${templateObj ? "yes" : "no"} mediaUrl=${mediaUrl || "(EMPTY)"} buttons=${buttons.length}`);
   await waitReplyDelay(ctx.settings, ctx.startedAt);
   const logs = await sendBotPayload(ctx.sock, ctx.exactRemoteJid, { text: finalMessageBody, mediaUrl, buttons, footer });
   if (!logs.length) return false;
