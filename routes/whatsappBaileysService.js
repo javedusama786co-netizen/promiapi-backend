@@ -939,9 +939,14 @@ async function sendBotPayload(sock, jid, { text = "", mediaUrl = "", buttons = [
   if (mediaUrl) {
     try {
       const mediaLogs = await sendMediaContent(sock, jid, mediaUrl, body);
-      if (mediaLogs) { logs.push(...mediaLogs); mediaSent = true; }
+      if (mediaLogs) {
+        logs.push(...mediaLogs); mediaSent = true;
+        console.log(`🖼️ [QR BOT] STEP 1 media message accepted by WhatsApp (id=${mediaLogs[0]?.id}, type=${mediaLogs[0]?.type})`);
+      } else {
+        console.error("❌ [QR BOT] STEP 1 media skipped: resolveMediaSource returned nothing for", mediaUrl);
+      }
     } catch (e) {
-      console.error("❌ Bot media send failed:", mediaUrl, "->", e.message);
+      console.error("❌ Bot media send failed:", mediaUrl, "->", e.message, e.stack ? "\n" + e.stack.split("\n").slice(1, 4).join("\n") : "");
     }
   }
 
@@ -950,6 +955,7 @@ async function sendBotPayload(sock, jid, { text = "", mediaUrl = "", buttons = [
     const btnBody = mediaSent ? "Please select an option:" : body;
     const sent = await sendButtonsMessage(sock, jid, btnBody, footer, buttons);
     markBotSent(sent?.key?.id);
+    console.log(`🔘 [QR BOT] STEP 2 buttons message accepted by WhatsApp (id=${sent?.key?.id}) | mediaSent=${mediaSent}`);
     logs.push({ id: sent?.key?.id, type: "interactive", text: btnBody || "Please select an option:", mediaUrl: null });
   } else if (!mediaSent && body) {
     const sent = await sock.sendMessage(jid, { text: footer ? `${body}\n\n_${footer}_` : body });
