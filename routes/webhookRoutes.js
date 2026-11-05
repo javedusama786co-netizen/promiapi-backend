@@ -16,6 +16,10 @@ const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.promiapi.com
 const ChatMessage = mongoose.models.ChatMessage || require("../models/ChatMessage");
 const BotReply = mongoose.models.BotReply || require("../models/BotReply"); 
 const BotFlow = mongoose.models.BotFlow || require("../models/BotFlow");
+
+// 🧩 Custom fields engine ({{variables}} in bot replies / flows, AI reads + saves contact details)
+let CF = null;
+try { CF = require("../utils/customFields"); } catch (e) { console.warn("ℹ️ [WEBHOOK] custom fields helper not available:", e.message); }
 const UserSession = mongoose.models.UserSession || require("../models/UserSession");
 const AiBotSettings = mongoose.models.AiBotSettings || require("../models/AiBotSettings");
 const Contact = mongoose.models.Contact || require("../models/Contact");
@@ -1501,7 +1505,10 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   const systemPrompt = settings.groq?.systemPrompt || settings.openai?.systemPrompt || "You are a helpful customer support assistant on WhatsApp. Reply briefly and clearly in the customer's language.";
 
   const waRules = "\n\nIMPORTANT RULES (WhatsApp channel):\n1. Answer ONLY what the customer asked in their latest message. Do NOT add extra details, other services, features or integrations they did not ask about.\n2. Never write one big paragraph. Use short lines separated by blank lines. For how-to questions use a numbered list (maximum 6 steps, one short line each). For other questions use 2-4 short sentences. Stay under 900 characters.\n3. If the question is broad (for example 'tell me your services' or 'details'), give a ONE-line overview and ask which specific thing they want to know more about.\n4. Do not repeat information that was already given earlier in the chat.\n5. Plain text only: no markdown tables, no # headings. Use *single asterisks* for bold, and '1.' or '-' for lists.\n6. Reply in the same language and script the customer writes in.\n7. Tone: polite, professional and friendly. Use at most one emoji. End with one short line offering further help.";
-  const messages = [{ role: "system", content: systemPrompt + waRules }];
+  // 🧩 CUSTOM FIELDS x AI: the customer's saved details go into the prompt, and the AI gets a tool to save new ones
+  let cfAi = null;
+  if (CF) cfAi = await CF.prepareAiContext({ ownerId: userId, customerPhone, settings });
+  const messages = [{ role: "system", content: systemPrompt + waRules + (cfAi?.profileBlock || "") }];
 
   // NOTE: ChatMessage schema has NO createdAt field (only `timestamp`). Sorting by createdAt returned the OLDEST messages, so the AI "forgot" the recent chat.
   const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ timestamp: -1, _id: -1 }).limit(12).lean();
@@ -1516,6 +1523,7 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   messages.push({ role: "user", content: String(userText || "").trim() || "Hello" });
 
   let tools = buildGroqTools(settings);
+  if (cfAi?.tool) tools.push(cfAi.tool);
   console.log(`🤖 [GROQ] Calling model=${model} | user=${userId} | customer=${customerPhone} | history=${history.length} | tools=${tools.length}`);
 
   for (let round = 0; round < 3; round++) {
@@ -1548,7 +1556,9 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
       for (const call of msg.tool_calls) {
         let args = {};
         try { args = JSON.parse(call.function?.arguments || "{}"); } catch (_) {}
-        const result = await fetchExternalCBSData(call.function.name, args, customerPhone, settings);
+        let result;
+        if (cfAi && call.function?.name === CF.TOOL_NAME) result = await cfAi.execute(args); // save name / city / ... to the contact
+        else result = await fetchExternalCBSData(call.function.name, args, customerPhone, settings);
         messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
       }
       continue;
@@ -1926,6 +1936,61 @@ async function waitReplyDelay(settings, startedAt) {
 async function sendBotWhatsApp(settings, startedAt, ...sendArgs) {
   await waitReplyDelay(settings, startedAt);
   return sendUniversalWhatsAppMessage(...sendArgs);
+}
+
+// =========================================================================
+// 🧩 CUSTOM FIELD VARIABLES for bot replies and visual flows (Cloud API + Instagram / Messenger)
+//    {{name}} {{first_name}} {{city}} {{budget|N/A}} ... -> this customer's saved details.
+//    Never throws: on any problem the original text is sent.
+// =========================================================================
+const FLOW_TEXT_KEYS = ["message", "text", "caption", "body", "footer", "footerText", "title", "label", "headerText", "header"];
+const hasVars = (v) => typeof v === "string" && v.includes("{{");
+const buttonHasVars = (btn) => (typeof btn === "string" ? hasVars(btn) : Boolean(btn) && [btn.text, btn.title, btn.label, btn.url].some(hasVars));
+
+async function customFieldRenderer(userId, contact) {
+  if (!CF) return null;
+  try {
+    const defsMap = await CF.loadDefsMap(userId);
+    const plain = contact && typeof contact.toObject === "function" ? contact.toObject() : (contact || {});
+    return { defsMap, ctx: CF.buildContext(plain, defsMap) };
+  } catch (e) {
+    console.warn("⚠️ [WEBHOOK] custom field variables skipped:", e.message);
+    return null;
+  }
+}
+
+async function renderRuleForContact(userId, contact, rule) {
+  if (!CF || !rule) return rule;
+  try {
+    const buttons = Array.isArray(rule.buttons) ? rule.buttons : [];
+    if (!(hasVars(rule.replyText) || hasVars(rule.footerText) || buttons.some(buttonHasVars))) return rule;
+    const r = await customFieldRenderer(userId, contact);
+    if (!r) return rule;
+    const plain = typeof rule.toObject === "function" ? rule.toObject() : { ...rule };
+    const { content, unknown } = CF.renderContent({ text: plain.replyText, footer: plain.footerText, buttons: plain.buttons }, r.ctx, r.defsMap);
+    if (unknown.length) console.warn(`⚠️ [BOT] unknown variable(s) ${unknown.map((k) => `{{${k}}}`).join(", ")} in a bot reply - create the custom field or fix the spelling.`);
+    return { ...plain, replyText: content.text, footerText: content.footer, buttons: content.buttons };
+  } catch (e) {
+    console.warn("⚠️ [BOT] variable rendering failed, sending the original reply:", e.message);
+    return rule;
+  }
+}
+
+async function renderFlowNodeData(userId, contact, nodeData) {
+  if (!CF || !nodeData) return nodeData;
+  try {
+    const buttons = Array.isArray(nodeData.buttons) ? nodeData.buttons : [];
+    if (!(FLOW_TEXT_KEYS.some((k) => hasVars(nodeData[k])) || buttons.some(buttonHasVars))) return nodeData;
+    const r = await customFieldRenderer(userId, contact);
+    if (!r) return nodeData;
+    const out = { ...nodeData };
+    FLOW_TEXT_KEYS.forEach((k) => { if (hasVars(out[k])) out[k] = CF.renderVariables(out[k], r.ctx, r.defsMap); });
+    if (buttons.length) out.buttons = CF.renderContent({ buttons }, r.ctx, r.defsMap).content.buttons;
+    return out;
+  } catch (e) {
+    console.warn("⚠️ [FLOW] variable rendering failed, sending the original node:", e.message);
+    return nodeData;
+  }
 }
 
 async function isDuplicateInbound(rawId) {
@@ -2644,7 +2709,7 @@ router.post("/", async (req, res) => {
 
                 if (targetNode) targetNode = skipEmptyFlowNodes(flow, targetNode);
 if (targetNode) {
-                  const nodeData = targetNode.data || {};
+                  const nodeData = await renderFlowNodeData(targetUserId, dbContact, targetNode.data || {});
                   const nodeMedia = pickFlowNodeMedia(targetNode);
                   const nodeText = pickFlowNodeText(nodeData);
                   console.log(`🎯 [FLOW NODE] id=${targetNode.id} type=${targetNode.type} media=${nodeMedia ? `${nodeMedia.kind}:${nodeMedia.url}` : "none"} text="${nodeText.substring(0, 40)}" dataKeys=[${Object.keys(nodeData).join(",")}]`);
@@ -2837,6 +2902,7 @@ if (targetNode) {
                 }
 
                 if (matchedRule) {
+                  matchedRule = await renderRuleForContact(targetUserId, dbContact, matchedRule); // 🧩 {{variables}}
                   let botPayload = {};
                   let templateObj = null;
                   let templateFallbackPayload = null;
@@ -3236,7 +3302,7 @@ if (targetNode) {
 
                     if (targetNode) targetNode = skipEmptyFlowNodes(flow, targetNode);
 if (targetNode) {
-                      const nodeData = targetNode.data || {};
+                      const nodeData = await renderFlowNodeData(targetUserId, dbContact, targetNode.data || {});
                       const replyText = pickFlowNodeText(nodeData) || pickFlowNodeText(nodeData, true) || "";
                       const buttonsList = nodeData.buttons || [];
                       const flowNodeMedia = pickFlowNodeMedia(targetNode);
@@ -3309,6 +3375,7 @@ if (targetNode) {
                     }
 
                     if (matchedRule) {
+                      matchedRule = await renderRuleForContact(targetUserId, dbContact, matchedRule); // 🧩 {{variables}}
                       let templateObj = null;
                       const lookupIdentifier = String(matchedRule.templateId || matchedRule.replyText || "").trim();
                       

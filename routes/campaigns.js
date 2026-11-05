@@ -7,6 +7,7 @@ const MessageLog = require("../models/MessageLog");
 const Notification = require("../models/Notification");
 const mongoose = require("mongoose");
 const auth = require("../middleware/auth");
+const CF = require("../utils/customFields"); // 🧩 custom fields engine ({{variables}}, audience filters)
 const axios = require("axios");
 const schedule = require("node-schedule");
 const { sendQrWhatsAppMessage, getActiveSocket } = require("../routes/whatsappBaileysService");
@@ -202,7 +203,9 @@ async function resolveTemplateParts(templateNameOrId, variableInput, contactName
 
     if (!body && !header && !media) return null;
 
-    const vars = String(variableInput || "").split(",").map((v) => v.trim()).filter(Boolean);
+    const vars = Array.isArray(variableInput)
+      ? variableInput.map((v) => String(v ?? ""))
+      : String(variableInput || "").split(",").map((v) => v.trim()).filter(Boolean);
     const fill = (str) => {
       let out = String(str || "");
       vars.forEach((val, index) => {
@@ -267,7 +270,8 @@ async function sendCampaignMessage({
   mediaUrl,
   templateName,
   language,
-  buttons
+  buttons,
+  templateParams
 }) {
   try {
     const activePlatform = normalizePlatform(platform);
@@ -318,7 +322,13 @@ async function sendCampaignMessage({
           });
         }
 
-        if (finalMessageText && !finalMessageText.startsWith("Template:")) {
+        if (Array.isArray(templateParams) && templateParams.length) {
+          // 🧩 per-contact values from variableMap ({{1}} -> first_name, {{2}} -> city ...)
+          components.push({
+            type: "body",
+            parameters: templateParams.map((val) => ({ type: "text", text: String(val || "-") }))
+          });
+        } else if (finalMessageText && !finalMessageText.startsWith("Template:")) {
           const bodyParams = finalMessageText
             .split(",")
             .map((val) => val.trim())
@@ -475,6 +485,17 @@ const handleCampaignExecution = async (req, res) => {
     );
     console.log(`📣 [Campaign] platform=${targetPlatform} buttons received: ${campaignButtons.length} (raw type: ${typeof buttons}) | header: ${campaignHeader ? "yes" : "no"} | footer: ${campaignFooter ? "yes" : "no"} | media: ${mediaUrl ? "yes" : "no"}`);
 
+    // 🧩 CUSTOM FIELDS inputs
+    //   audienceFilter : { match:"all"|"any", conditions:[{ field, op, value }] }  (extra filter on top of the group)
+    //   variableMap    : { "1":"first_name", "2":"city|Sir" }  (template {{1}}, {{2}} -> contact field, per contact)
+    //   missingVariablePolicy : "fallback" (default: empty / fallback text) | "skip" (do not message contacts with a missing value)
+    //   skipStatuses   : ["UNSUBSCRIBED","BLOCKED","INVALID"]  (never message these)
+    const audienceFilterRaw = CF.parseJsonLoose(req.body.audienceFilter ?? req.body.filter);
+    const variableMapRaw = CF.parseJsonLoose(req.body.variableMap ?? req.body.templateVariables);
+    const missingPolicy = String(req.body.missingVariablePolicy || "fallback").toLowerCase() === "skip" ? "skip" : "fallback";
+    const skipStatuses = (Array.isArray(CF.parseJsonLoose(req.body.skipStatuses)) ? CF.parseJsonLoose(req.body.skipStatuses) : [])
+      .map((s) => String(s).toUpperCase()).filter((s) => ["UNSUBSCRIBED", "BLOCKED", "INVALID", "PENDING", "PENDING_AGENT", "ASSIGNED", "ACTIVE"].includes(s));
+
     if (targetPlatform === "whatsapp") {
       if (!fallbackMessage && !mediaUrl && !templateName && !campaignHeader) {
         missingRequirements.push({ requirement: "Text / Template / Media Content", status: "MISSING", details: "WhatsApp campaigns require text, header, mediaUrl, or templateName." });
@@ -488,6 +509,18 @@ const handleCampaignExecution = async (req, res) => {
     }
 
     const userConditions = getAdminQueryFilter(businessScopeId);
+
+    // 🧩 field definitions of this business + the audience filter (validated before anything is sent)
+    const defsMap = await CF.loadDefsMap(businessScopeId);
+    let audienceQuery = {};
+    if (audienceFilterRaw) {
+      const builtAudience = CF.buildAudienceQuery(audienceFilterRaw, defsMap);
+      if (builtAudience.errors.length) {
+        return res.status(400).json({ success: false, message: "Audience filter is invalid.", errors: builtAudience.errors });
+      }
+      audienceQuery = builtAudience.query;
+    }
+
     const WhatsAppConfig = mongoose.models.WhatsAppConfig || mongoose.model("WhatsAppConfig", new mongoose.Schema({}, { strict: false }), "whatsappconfigs");
 
     const possibleUserIds = [String(businessScopeId)];
@@ -600,12 +633,39 @@ const handleCampaignExecution = async (req, res) => {
         };
       }
 
-      const matchedContacts = await Contact.find({ $and: [{ $or: userConditions }, groupFilter] });
+      const matchedContacts = await Contact.find({
+        $and: [
+          { $or: userConditions },
+          groupFilter,
+          audienceQuery,
+          ...(skipStatuses.length ? [{ status: { $nin: skipStatuses } }] : [])
+        ]
+      });
       targetContacts = matchedContacts.filter((c) => Boolean(getContactRecipient(c, targetPlatform)));
     }
 
     if (targetContacts.length === 0) {
       return res.status(400).json({ success: false, message: `No valid contacts found for platform '${targetPlatform.toUpperCase()}'.` });
+    }
+
+    // 🧩 PREFLIGHT: every {{variable}} must be a built-in or a defined custom field (typos are caught BEFORE sending)
+    {
+      const buttonTexts = campaignButtons.flatMap((btn) => (typeof btn === "string" ? [btn] : [btn?.text, btn?.title, btn?.label, btn?.url]));
+      const textsToCheck = [fallbackMessage, campaignHeader, campaignFooter, ...buttonTexts].filter((t) => typeof t === "string" && t);
+      if (templateName) {
+        try {
+          const tplParts = await resolveTemplateParts(templateName, "", "");
+          if (tplParts) textsToCheck.push(tplParts.body, tplParts.header, tplParts.footer);
+        } catch (e) { /* template text check is best-effort */ }
+      }
+      const unknownVars = CF.findUnknownVariables(textsToCheck, defsMap);
+      if (unknownVars.length) {
+        return res.status(400).json({
+          success: false,
+          message: `Unknown variable(s): ${unknownVars.map((v) => `{{${v}}}`).join(", ")}. Create the custom field first or fix the spelling.`,
+          unknownVariables: unknownVars
+        });
+      }
     }
 
     // 🔌 QR session connected na ho to campaign shuru hi na karo (warna har contact "failed" hota)
@@ -629,6 +689,10 @@ const handleCampaignExecution = async (req, res) => {
       footer: campaignFooter || null,
       buttons: campaignButtons,
       message: fallbackMessage || (templateName ? `Template: ${templateName}` : "Media Payload"),
+      audienceFilter: audienceFilterRaw || null,
+      variableMap: variableMapRaw || null,
+      missingVariablePolicy: missingPolicy,
+      skipStatuses,
       status: scheduledTime ? "SCHEDULED" : "PROCESSING",
       totalContacts: targetContacts.length,
       successCount: 0,
@@ -639,11 +703,18 @@ const handleCampaignExecution = async (req, res) => {
     const runCampaignPayload = async () => {
       let successCount = 0;
       let failureCount = 0;
+      let skippedCount = 0;
       const failureReasons = [];
 
       for (const contact of targetContacts) {
         const recipientValue = getContactRecipient(contact, targetPlatform);
         let personalText = fallbackMessage;
+
+        // 🧩 this contact's values ({{name}}, {{city}} ...) and, for templates, its {{1}} {{2}} values from variableMap
+        const cctx = CF.buildContext(contact, defsMap);
+        const tplValues = (templateName && variableMapRaw)
+          ? CF.resolveTemplateValues(variableMapRaw, cctx, defsMap, { forMeta: !isQrEngine, commaSafe: true })
+          : null;
 
         // 🌐 QR ENGINE: header / footer / buttons / media bhi har contact ke liye taiyar karo
         let personalHeader = fillContactName(campaignHeader, contact.name);
@@ -653,7 +724,7 @@ const handleCampaignExecution = async (req, res) => {
         let templateMissing = false;
 
         if (isQrEngine && targetPlatform === "whatsapp" && templateName) {
-          const parts = await resolveTemplateParts(templateName, fallbackMessage, contact.name);
+          const parts = await resolveTemplateParts(templateName, tplValues ? tplValues.values : fallbackMessage, contact.name);
           if (parts) {
             personalText = parts.body;
             personalHeader = parts.header || personalHeader;
@@ -665,6 +736,33 @@ const handleCampaignExecution = async (req, res) => {
           }
         } else if (personalText && !templateName) {
           personalText = personalText.replace(/\{\{\s*name\s*\}\}/gi, contact.name || "Customer");
+        }
+
+        // 🧩 CUSTOM FIELDS: {{city}} / {{budget|N/A}} ... inside text, header, footer and buttons
+        {
+          const isCloudTemplate = Boolean(templateName) && !isQrEngine; // personalText is a comma separated parameter list there
+          const rendered = CF.renderContent(
+            { text: personalText, header: personalHeader, footer: personalFooter, buttons: personalButtons },
+            cctx, defsMap, { commaSafe: isCloudTemplate }
+          );
+          personalText = rendered.content.text;
+          personalHeader = rendered.content.header;
+          personalFooter = rendered.content.footer;
+          personalButtons = rendered.content.buttons;
+
+          const missingVars = new Set(rendered.missing);
+          if (tplValues) tplValues.missing.forEach((m) => missingVars.add(m.key));
+          if (missingPolicy === "skip" && missingVars.size) {
+            failureCount++;
+            skippedCount++;
+            failureReasons.push({
+              contactName: contact.name || "Unknown",
+              contactId: String(contact._id || ""),
+              reason: "MISSING_VARIABLE",
+              details: `No value for: ${[...missingVars].map((k) => `{{${k}}}`).join(", ")}`
+            });
+            continue; // nothing is sent to this contact
+          }
         }
 
         const msgBody = targetPlatform === "whatsapp" && templateName 
@@ -727,7 +825,8 @@ const handleCampaignExecution = async (req, res) => {
               mediaUrl,
               templateName: targetPlatform === "whatsapp" ? templateName : null,
               language,
-              buttons: campaignButtons
+              buttons: campaignButtons,
+              templateParams: tplValues ? tplValues.values : undefined
             });
           }
 
@@ -841,6 +940,7 @@ const handleCampaignExecution = async (req, res) => {
         status: isCompleteFailure ? "FAILED" : "SENT",
         successCount,
         failureCount,
+        skippedCount,
         lastError: lastError || null,
         failureReasons: failureReasons.slice(0, 50)
       });
@@ -922,6 +1022,51 @@ router.post("/send", auth, handleCampaignExecution);
 router.post("/trigger", auth, handleCampaignExecution);
 router.post("/broadcast", auth, handleCampaignExecution);
 router.post("/", auth, handleCampaignExecution);
+
+// 🧩 DRY RUN: "how many contacts match, who is missing a value, what does the message look like" - nothing is sent
+router.post("/audience-preview", auth, async (req, res) => {
+  try {
+    const businessScopeId = req.user?.adminId || req.user?.id || req.user?._id;
+    const userConditions = getAdminQueryFilter(businessScopeId);
+    const defsMap = await CF.loadDefsMap(businessScopeId);
+    const b = req.body || {};
+    const platform = normalizePlatform(b.platform);
+    const templateName = b.templateName || b.template;
+    const text = String(b.messageText ?? b.message ?? b.text ?? b.body ?? "").trim();
+    const header = typeof b.header === "object" && b.header ? String(b.header.text || "") : String(b.header ?? b.headerText ?? "");
+    const footer = String(b.footer ?? b.footerText ?? "");
+    const variableMap = CF.parseJsonLoose(b.variableMap ?? b.templateVariables);
+
+    const texts = [text, header, footer].filter(Boolean);
+    if (templateName) {
+      try {
+        const tp = await resolveTemplateParts(templateName, "", "");
+        if (tp) texts.push(tp.body, tp.header, tp.footer);
+      } catch (e) { /* optional */ }
+    }
+
+    const out = await CF.previewAudience({
+      scopeConditions: userConditions,
+      group: b.targetGroup || b.group || "All",
+      filter: CF.parseJsonLoose(b.audienceFilter ?? b.filter),
+      defsMap,
+      recipientOf: (c) => getContactRecipient(c, platform),
+      texts: texts.filter(Boolean),
+      skipStatuses: Array.isArray(CF.parseJsonLoose(b.skipStatuses)) ? CF.parseJsonLoose(b.skipStatuses) : []
+    });
+    if (!out.ok) return res.status(400).json({ success: false, message: "Audience filter is invalid.", errors: out.errors });
+
+    if (variableMap) {
+      out.sample = out.sample.map((s) => ({
+        ...s,
+        templateValues: CF.resolveTemplateValues(variableMap, CF.buildContext(s, defsMap), defsMap, { forMeta: platform === "whatsapp" }).values
+      }));
+    }
+    return res.json({ success: true, ...out, ok: undefined });
+  } catch (err) {
+    return res.status(500).json({ success: false, message: "Audience preview failed.", error: err.message });
+  }
+});
 
 router.get("/", auth, async (req, res) => {
   try {

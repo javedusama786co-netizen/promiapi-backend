@@ -14,6 +14,10 @@ const ffmpeg = require("fluent-ffmpeg"); // 🔥 FFmpeg imported for proper voic
 let R2 = null;
 try { R2 = require("../middleware/upload"); } catch (e) { console.warn("ℹ️ [QR BOT] R2 helper not available:", e.message); }
 
+// 🧩 Custom fields engine ({{variables}} in bot replies / flows, AI reads + saves contact details)
+let CF = null;
+try { CF = require("../utils/customFields"); } catch (e) { console.warn("ℹ️ [QR BOT] custom fields helper not available:", e.message); }
+
 // 🌐 Safe Models Import for Bot, Flow & AI Integration
 function safeModel(name, file) {
   if (mongoose.models[name]) return mongoose.models[name];
@@ -32,17 +36,6 @@ const Order = safeModel("Order", "../models/Order");
 // ⚙️ CONFIG
 const PUBLIC_BASE_URL = process.env.PUBLIC_BASE_URL || "https://api.promiapi.com";
 const UPLOAD_DIR = path.join(__dirname, "../uploads");
-
-/** copy a file this service wrote into ./uploads to Cloudflare R2 under the same "/uploads/<fileName>" path
- *  (Render's disk is wiped on every restart, so customer media / DPs would otherwise vanish) */
-async function mirrorToR2(localPath, fileName, contentType) {
-  if (!R2?.R2_ENABLED || typeof R2.putLocalFile !== "function") return;
-  try {
-    await R2.putLocalFile(localPath, `uploads/${fileName}`, contentType);
-  } catch (e) {
-    console.error(`⚠️ [R2] could not copy ${fileName} to R2:`, e.message);
-  }
-}
 const BUTTONS_MODE = String(process.env.BAILEYS_BUTTONS_MODE || "text").toLowerCase();
 const PENDING_TTL_MS = 2 * 60 * 60 * 1000;
 
@@ -102,10 +95,8 @@ const fetchUserProfilePicture = async (sock, jid, phoneHint = "") => {
         const buf = Buffer.from(resp.data);
         if (!buf.length) return ppUrl;
         if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-        // unique name: files are cached "immutable" in R2/browsers, so a refreshed DP needs a new URL
-        const fileName = `dp-${digits}-${Date.now()}.jpg`;
+        const fileName = `dp-${digits}.jpg`;
         fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buf);
-        await mirrorToR2(path.join(UPLOAD_DIR, fileName), fileName, "image/jpeg");
         console.log(`🖼️ [DP] ${digits}: saved /uploads/${fileName}`);
         return `/uploads/${fileName}`;
     } catch (dlErr) {
@@ -456,7 +447,10 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   const systemPrompt = settings.groq?.systemPrompt || settings.openai?.systemPrompt || "You are a helpful customer support assistant on WhatsApp. Reply briefly and clearly in the customer's language.";
 
   const waRules = "\n\nIMPORTANT RULES (WhatsApp channel):\n1. Answer ONLY what the customer asked in their latest message. Do NOT add extra details, other services, features or integrations they did not ask about.\n2. Never write one big paragraph. Use short lines separated by blank lines. For how-to questions use a numbered list (maximum 6 steps, one short line each). For other questions use 2-4 short sentences. Stay under 900 characters.\n3. If the question is broad (for example 'tell me your services' or 'details'), give a ONE-line overview and ask which specific thing they want to know more about.\n4. Do not repeat information that was already given earlier in the chat.\n5. Plain text only: no markdown tables, no # headings. Use *single asterisks* for bold, and '1.' or '-' for lists.\n6. Reply in the same language and script the customer writes in.\n7. Tone: polite, professional and friendly. Use at most one emoji. End with one short line offering further help.";
-  const messages = [{ role: "system", content: systemPrompt + waRules }];
+  // 🧩 CUSTOM FIELDS x AI: the customer's saved details go into the prompt, and the AI gets a tool to save new ones
+  let cfAi = null;
+  if (CF) cfAi = await CF.prepareAiContext({ ownerId: userId, customerPhone, settings });
+  const messages = [{ role: "system", content: systemPrompt + waRules + (cfAi?.profileBlock || "") }];
 
   // ChatMessage has NO createdAt field (only `timestamp`): sort by timestamp to get the most RECENT messages.
   const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ timestamp: -1, _id: -1 }).limit(12).lean();
@@ -471,6 +465,7 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   messages.push({ role: "user", content: String(userText || "").trim() || "Hello" });
 
   let tools = buildGroqTools(settings);
+  if (cfAi?.tool) tools.push(cfAi.tool);
   console.log(`🤖 [QR GROQ] Calling model=${model} | user=${userId} | customer=${customerPhone} | history=${history.length} | tools=${tools.length}`);
 
   for (let round = 0; round < 3; round++) {
@@ -503,7 +498,9 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
       for (const call of msg.tool_calls) {
         let args = {};
         try { args = JSON.parse(call.function?.arguments || "{}"); } catch (_) {}
-        const result = await fetchExternalCBSData(call.function.name, args, customerPhone, settings);
+        let result;
+        if (cfAi && call.function?.name === CF.TOOL_NAME) result = await cfAi.execute(args); // save name / city / ... to the contact
+        else result = await fetchExternalCBSData(call.function.name, args, customerPhone, settings);
         messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
       }
       continue;
@@ -1131,6 +1128,24 @@ function findButtonClick(flow, cleanKeyword, cleanButtonId, onlyNodeId = null) {
   return null;
 }
 
+// 🧩 {{name}} {{city}} {{budget|N/A}} ... -> this customer's saved details. Falls back to the original content on any problem.
+async function renderForContact(ctx, content) {
+  if (!CF || !content) return content;
+  try {
+    const hasVars = [content.text, content.footer, content.header, ...(content.buttons || []).flatMap((b) => [b?.text, b?.url])]
+      .some((t) => typeof t === "string" && t.includes("{{"));
+    if (!hasVars) return content;
+    const defsMap = await CF.loadDefsMap(ctx.userId);
+    const contact = ctx.contact || { name: ctx.customerName, phone: ctx.customerPhone };
+    const { content: out, unknown } = CF.renderContent(content, CF.buildContext(contact, defsMap), defsMap);
+    if (unknown.length) console.warn(`⚠️ [QR BOT] unknown variable(s) ${unknown.map((k) => `{{${k}}}`).join(", ")} in a reply - create the custom field or fix the spelling.`);
+    return out;
+  } catch (e) {
+    console.warn("⚠️ [QR BOT] variable rendering failed, sending the original text:", e.message);
+    return content;
+  }
+}
+
 function extractNodeContent(node) {
   const d = node.data || {};
   const mediaUrl = d.mediaUrl || d.media || d.fileUrl || d.imageUrl || d.videoUrl || d.documentUrl || "";
@@ -1156,7 +1171,7 @@ async function runFlowChain(ctx, flow, startNode) {
 
   while (node && !visited.has(node.id) && visited.size < 10) {
     visited.add(node.id);
-    const content = extractNodeContent(node);
+    const content = await renderForContact(ctx, extractNodeContent(node));
 
     if (content.text || content.mediaUrl || content.buttons.length) {
       await waitReplyDelay(ctx.settings, ctx.startedAt);
@@ -1296,6 +1311,14 @@ async function sendRuleReply(ctx, rule) {
 
   if (!finalMessageBody && !mediaUrl && !buttons.length) {
     return false;
+  }
+
+  // 🧩 custom field variables for this customer
+  {
+    const rendered = await renderForContact(ctx, { text: finalMessageBody, footer, buttons });
+    finalMessageBody = rendered.text;
+    footer = rendered.footer;
+    buttons = rendered.buttons;
   }
 
   console.log(`🤖 [QR BOT] rule ${rule._id} type=${rule.botType} template=${templateObj ? "yes" : "no"} mediaUrl=${mediaUrl || "(EMPTY)"} buttons=${buttons.length}`);
@@ -1614,7 +1637,6 @@ async function saveInboundMedia(sock, msg, msgContent, messageType) {
     if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
     const fileName = `wa-in-${messageType}-${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
     fs.writeFileSync(path.join(UPLOAD_DIR, fileName), buffer);
-    await mirrorToR2(path.join(UPLOAD_DIR, fileName), fileName, node.mimetype || MIME_BY_EXT[ext] || "application/octet-stream");
     return `/uploads/${fileName}`;
   } catch (err) {
     console.error(`❌ [QR] Incoming ${messageType} download failed:`, err.message);
@@ -1790,7 +1812,7 @@ async function handleInboundMessage(sock, userId, msg) {
 
   try {
     await runAutomation(
-      { sock, userId, customerPhone, exactRemoteJid, customerName: dbContact?.name || profileName, settings: botSettings, startedAt: botStartedAt },
+      { sock, userId, customerPhone, exactRemoteJid, customerName: dbContact?.name || profileName, settings: botSettings, startedAt: botStartedAt, contact: dbContact && typeof dbContact.toObject === "function" ? dbContact.toObject() : dbContact },
       messageText,
       buttonPayloadId
     );

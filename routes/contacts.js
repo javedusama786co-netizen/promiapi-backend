@@ -7,6 +7,8 @@ const mongoose = require('mongoose');
 const Contact = require('../models/Contact');
 const Group = require('../models/Group');
 const auth = require('../middleware/auth');
+const CF = require('../utils/customFields');          // 🧩 custom fields engine
+const CustomField = require('../models/CustomField');
 
 // ⚡ Centralized Baileys Service Import for DP fetching
 const { getActiveSocket, fetchUserProfilePicture } = require('../routes/whatsappBaileysService');
@@ -87,6 +89,53 @@ async function fetchContactDp(phone, userId) {
   } catch (err) {
     return null;
   }
+}
+
+// 🧩 Excel/CSV headers that already mean something (everything else may become a custom field)
+const BUILTIN_HEADERS = new Set(['name', 'contactname', 'platform', 'phone', 'number', 'mobile', 'recipientid', 'id', 'instagramid', 'facebookid', 'tags', 'group', 'sourcead']);
+const headerKey = (h) => String(h || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+
+/** maps spreadsheet headers to custom field keys. returns { map:{header:key}, ignored:[header], created:[key] } */
+async function mapCustomColumns({ headers, defsMap, columnMapInput, autoCreate, ownerId, canCreate }) {
+  const map = {}, ignored = [], created = [];
+  const byLabel = {};
+  Object.values(defsMap).forEach((d) => { byLabel[String(d.label || '').trim().toLowerCase()] = d.key; });
+  let total = Object.keys(defsMap).length;
+
+  for (const header of headers) {
+    const h = String(header || '').trim();
+    if (!h || BUILTIN_HEADERS.has(headerKey(h))) continue;
+
+    // 1) explicit mapping from the screen: { "Shehar": "city", "Notes": "" }  ("" = ignore this column)
+    if (Object.prototype.hasOwnProperty.call(columnMapInput, header)) {
+      const target = String(columnMapInput[header] || '').trim().toLowerCase();
+      if (target && defsMap[target]) map[header] = target; else ignored.push(h);
+      continue;
+    }
+    // 2) same key / same label (also accepts "cf_city" and "custom_city")
+    const stripped = h.replace(/^(cf|custom)[\s_.-]+/i, '');
+    const candidate = [CF.normalizeKey(h), CF.normalizeKey(stripped)].find((k) => defsMap[k]) || byLabel[h.toLowerCase()] || byLabel[stripped.toLowerCase()];
+    if (candidate) { map[header] = candidate; continue; }
+
+    // 3) optional: create a new text field for this column
+    if (autoCreate && canCreate && total < 50) {
+      const key = CF.normalizeKey(stripped);
+      if (CF.isValidKey(key) && !CF.isReservedKey(key)) {
+        try {
+          const def = await CustomField.findOneAndUpdate(
+            { userId: ownerId, key },
+            { $setOnInsert: { userId: ownerId, key, label: stripped.slice(0, 60), type: 'text', aiRead: true, aiWrite: true, sortOrder: total } },
+            { upsert: true, new: true }
+          ).lean();
+          defsMap[def.key] = def; map[header] = def.key; created.push(def.key); total++;
+          continue;
+        } catch (e) { console.error('Auto-create field error:', e.message); }
+      }
+    }
+    ignored.push(h);
+  }
+  if (created.length) CF.invalidateDefs(ownerId);
+  return { map, ignored, created };
 }
 
 function resolveContactIds({ platform, phone, recipientId, facebookId, instagramId }) {
@@ -288,8 +337,25 @@ router.get('/', auth, async (req, res) => {
     if (sourceAd && sourceAd !== 'All') query.sourceAd = sourceAd;
     if (platform && platform !== 'All') query.platform = platform.toLowerCase();
 
+    // 🧩 custom field filters:  ?filter={"match":"all","conditions":[{"field":"city","op":"eq","value":"Lahore"}]}   or   ?cf[city]=Lahore
+    const defsMap = await CF.loadDefsMap(adminId || userId);
+    const extra = [];
+    const advanced = CF.parseJsonLoose(req.query.filter);
+    if (advanced) {
+      const built = CF.buildAudienceQuery(advanced, defsMap);
+      if (built.errors.length) return res.status(400).json({ success: false, message: 'Invalid filter.', errors: built.errors });
+      extra.push(built.query);
+    }
+    if (req.query.cf && typeof req.query.cf === 'object') {
+      const simple = Object.entries(req.query.cf).slice(0, 20).map(([field, value]) => ({ field, op: 'eq', value }));
+      const built = CF.buildAudienceQuery({ match: 'all', conditions: simple }, defsMap);
+      if (built.errors.length) return res.status(400).json({ success: false, message: 'Invalid filter.', errors: built.errors });
+      extra.push(built.query);
+    }
+    if (extra.length) query = { $and: [query, ...extra] };
+
     const contacts = await Contact.find(query).sort({ createdAt: -1 });
-    res.json({ success: true, contacts: contacts.map(withAbsoluteDp) });
+    res.json({ success: true, contacts: contacts.map(withAbsoluteDp), customFieldDefs: Object.values(defsMap) });
   } catch (err) {
     console.error("Fetch Contacts Error:", err);
     res.status(500).json({ success: false, message: 'Server Error' });
@@ -297,7 +363,7 @@ router.get('/', auth, async (req, res) => {
 });
 
 router.post('/add', auth, async (req, res) => {
-  const { platform, name, phone, recipientId, facebookId, instagramId, group, tags, sourceAd } = req.body;
+  const { platform, name, phone, recipientId, facebookId, instagramId, group, tags, sourceAd, customFields } = req.body;
   try {
     const { userId, adminId, ownerId, role } = resolveOwner(req.user);
 
@@ -319,6 +385,21 @@ router.post('/add', auth, async (req, res) => {
           : "Recipient ID is required for social messaging."
       });
     }
+
+    // 🧩 custom fields sent with the new contact
+    let cfValues = {};
+    const cfInput = CF.parseJsonLoose(customFields);
+    if (cfInput) {
+      const checked = CF.validateFieldInput(await CF.loadDefsMap(ownerId), cfInput);
+      if (checked.errors.length) {
+        return res.status(400).json({ success: false, message: 'Some custom fields are invalid.', errors: checked.errors });
+      }
+      cfValues = checked.values;
+    }
+    const cfMeta = {};
+    const nowStamp = new Date();
+    Object.keys(cfValues).forEach((k) => { cfMeta[k] = { source: 'manual', at: nowStamp }; });
+    if (name && String(name).trim()) cfMeta.name = { source: 'manual', at: nowStamp };
 
     const groupOwnerId = (role === 'agent' && adminId) ? adminId : userId;
 
@@ -360,7 +441,9 @@ router.post('/add', auth, async (req, res) => {
       sourceAd: sourceAd || null,
       tags: parsedTags,
       status: calculatedStatus,
-      waCheckedAt: waCheckedAt
+      waCheckedAt: waCheckedAt,
+      customFields: cfValues,
+      customFieldMeta: cfMeta
     });
 
     const contact = await newContact.save();
@@ -397,7 +480,32 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
       return res.status(400).json({ success: false, message: 'Excel sheet is empty.' });
     }
 
-    const processRow = async (row) => {
+    // 🧩 spreadsheet columns -> custom fields (matched by key/label, explicit columnMap, or auto-created text fields)
+    const defsMap = await CF.loadDefsMap(ownerId);
+    const colMap = await mapCustomColumns({
+      headers: Object.keys(excelRows[0] || {}),
+      defsMap,
+      columnMapInput: CF.parseJsonLoose(req.body.columnMap) || {},
+      autoCreate: String(req.body.autoCreateFields || '').toLowerCase() === 'true',
+      ownerId,
+      canCreate: String(req.user.role || 'admin').toLowerCase() !== 'agent'
+    });
+    const fieldWarnings = [];
+    const buildRowCustomFields = (row, rowIndex) => {
+      const raw = {};
+      Object.entries(colMap.map).forEach(([header, key]) => {
+        if (row[header] !== undefined && String(row[header]).trim() !== '') raw[key] = row[header];
+      });
+      const checked = CF.validateFieldInput(defsMap, raw);
+      checked.errors.forEach((e) => fieldWarnings.push({ row: rowIndex + 2, ...e })); // +2: header row + 1-based
+      const at = new Date();
+      const meta = {};
+      Object.keys(checked.values).forEach((k) => { meta[k] = { source: 'import', at }; });
+      return { customFields: checked.values, customFieldMeta: meta };
+    };
+
+    const processRow = async (row, rowIndex = 0) => {
+      const cfPart = buildRowCustomFields(row, rowIndex);
       const rawName = String(row.Name || row.name || row['Contact Name'] || '').trim();
       const rawPlatform = String(row.Platform || row.platform || req.body.platform || 'whatsapp').toLowerCase().trim();
       
@@ -430,6 +538,7 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
           group: row.Group || row.group || defaultGroup,
           sourceAd: row.SourceAd || row.sourceAd || null,
           tags: tagsArray,
+          ...cfPart,
           status: waCheck.status,
           waCheckedAt: waCheck.checked ? new Date() : null
         };
@@ -448,6 +557,7 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
           group: row.Group || row.group || defaultGroup,
           sourceAd: row.SourceAd || row.sourceAd || null,
           tags: tagsArray,
+          ...cfPart,
           status: 'ACTIVE'
         };
       }
@@ -465,6 +575,7 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
           group: row.Group || row.group || defaultGroup,
           sourceAd: row.SourceAd || row.sourceAd || null,
           tags: tagsArray,
+          ...cfPart,
           status: 'ACTIVE'
         };
       }
@@ -476,7 +587,7 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
     const resolvedContacts = [];
     const BATCH = 5;
     for (let i = 0; i < excelRows.length; i += BATCH) {
-      const part = await Promise.all(excelRows.slice(i, i + BATCH).map(processRow));
+      const part = await Promise.all(excelRows.slice(i, i + BATCH).map((row, j) => processRow(row, i + j)));
       resolvedContacts.push(...part);
     }
     const validContacts = resolvedContacts.filter(Boolean);
@@ -493,7 +604,14 @@ router.post('/bulk-import', auth, upload.single('excelFile'), async (req, res) =
     res.json({
       success: true,
       count: insertedContacts.length,
-      insertedContacts
+      insertedContacts,
+      customFields: {
+        mappedColumns: colMap.map,
+        ignoredColumns: colMap.ignored,
+        createdFields: colMap.created,
+        warningCount: fieldWarnings.length,
+        warnings: fieldWarnings.slice(0, 50)
+      }
     });
   } catch (err) {
     console.error('Bulk import error:', err);
@@ -589,6 +707,83 @@ router.delete('/:id', auth, async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ success: false, message: 'Server error' });
+  }
+});
+
+// =========================================================================
+// 🧩 CUSTOM FIELD VALUES
+// =========================================================================
+
+// Set / clear custom field values (and the name) of ONE contact.  Body: { fields: { city: "Lahore", budget: 50000 }, clear: ["interest"] }
+router.patch('/:id/custom-fields', auth, async (req, res) => {
+  try {
+    const { userId, ownerId, scope } = resolveOwner(req.user);
+    if (!mongoose.Types.ObjectId.isValid(req.params.id)) return res.status(400).json({ success: false, message: 'Invalid contact id.' });
+
+    const contact = await Contact.findOne({ _id: req.params.id, ...scope }).lean();
+    if (!contact) return res.status(404).json({ success: false, message: 'Contact not found or unauthorized' });
+
+    const updates = { ...(req.body && typeof req.body.fields === 'object' && req.body.fields ? req.body.fields : {}) };
+    (Array.isArray(req.body?.clear) ? req.body.clear : []).forEach((k) => { updates[String(k).toLowerCase()] = null; });
+    if (!Object.keys(updates).length) return res.status(400).json({ success: false, message: 'Send { fields: {...} } or { clear: [...] }.' });
+
+    const result = await CF.applyContactFieldUpdates(contact, updates, { ownerId, source: 'manual', actor: userId });
+    if (result.rejected.length && !result.applied.length && !result.unchanged.length) {
+      return res.status(400).json({ success: false, message: 'No custom field was saved.', result });
+    }
+    const fresh = await Contact.findById(contact._id);
+    res.json({ success: true, contact: withAbsoluteDp(fresh), result });
+  } catch (err) {
+    console.error('Update Custom Fields Error:', err);
+    res.status(500).json({ success: false, message: 'Failed to update custom fields' });
+  }
+});
+
+// Bulk edit.  Body: { contactIds:[...] | filter:{...} | group:"Leads",  fields:{ city:"Lahore" }  |  clear:["city"],  onlyIfEmpty:true }
+router.post('/bulk-fields', auth, async (req, res) => {
+  try {
+    const { userId, ownerId, scope } = resolveOwner(req.user);
+    const body = req.body || {};
+    const defsMap = await CF.loadDefsMap(ownerId);
+
+    const updates = { ...(body.fields && typeof body.fields === 'object' ? body.fields : {}) };
+    (Array.isArray(body.clear) ? body.clear : []).forEach((k) => { updates[String(k).toLowerCase()] = null; });
+    if (!Object.keys(updates).length) return res.status(400).json({ success: false, message: 'Send fields to set or keys to clear.' });
+    if ('name' in updates) return res.status(400).json({ success: false, message: 'Bulk edit does not change names.' });
+
+    const and = [{ $or: scope.$or }];
+    if (Array.isArray(body.contactIds) && body.contactIds.length) {
+      const ids = body.contactIds.filter((id) => mongoose.Types.ObjectId.isValid(id)).slice(0, 5000);
+      if (!ids.length) return res.status(400).json({ success: false, message: 'No valid contact ids.' });
+      and.push({ _id: { $in: ids } });
+    } else if (body.filter || body.group) {
+      const built = CF.buildAudienceQuery(CF.parseJsonLoose(body.filter), defsMap);
+      if (built.errors.length) return res.status(400).json({ success: false, message: 'Invalid filter.', errors: built.errors });
+      and.push(CF.buildGroupFilter(body.group || 'All'), built.query);
+    } else {
+      return res.status(400).json({ success: false, message: 'Send contactIds, or a filter / group to choose the contacts.' });
+    }
+
+    const contacts = await Contact.find({ $and: and }).limit(5000).lean();
+    let updated = 0, unchanged = 0;
+    const problems = [];
+    for (let i = 0; i < contacts.length; i += 25) {
+      const part = await Promise.all(contacts.slice(i, i + 25).map((c) => {
+        let u = updates;
+        if (body.onlyIfEmpty === true) {
+          u = Object.fromEntries(Object.entries(updates).filter(([k]) => c.customFields?.[k] === undefined || c.customFields?.[k] === null || c.customFields?.[k] === ''));
+        }
+        return CF.applyContactFieldUpdates(c, u, { ownerId, source: 'bulk', actor: userId, defsMap });
+      }));
+      part.forEach((r) => {
+        if (r.applied.length) updated++; else unchanged++;
+        r.rejected.forEach((x) => { if (problems.length < 20 && !problems.some((p) => p.key === x.key && p.error === x.error)) problems.push(x); });
+      });
+    }
+    res.json({ success: true, matched: contacts.length, updated, unchanged, problems });
+  } catch (err) {
+    console.error('Bulk Custom Fields Error:', err);
+    res.status(500).json({ success: false, message: 'Bulk update failed' });
   }
 });
 

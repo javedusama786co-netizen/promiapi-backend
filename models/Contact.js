@@ -78,6 +78,16 @@ const contactSchema = new mongoose.Schema(
     waCheckedAt: {
       type: Date,
       default: null
+    },
+    // 🧩 CUSTOM FIELDS: values of the fields defined in the CustomField model, e.g. { city: "Lahore", budget: 50000 }
+    customFields: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
+    },
+    // where each value came from: { city: { source: "ai", at: Date } } ("manual" values are protected from the AI)
+    customFieldMeta: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {}
     }
   },
   {
@@ -90,5 +100,7 @@ contactSchema.index({ userId: 1, platform: 1 });
 contactSchema.index({ userId: 1, phone: 1 });
 contactSchema.index({ userId: 1, recipientId: 1 });
 contactSchema.index({ userId: 1, platform: 1, waCheckedAt: 1 });
+contactSchema.index({ userId: 1, group: 1 });
+contactSchema.index({ adminId: 1, phone: 1 });
 
 module.exports = mongoose.model('Contact', contactSchema);

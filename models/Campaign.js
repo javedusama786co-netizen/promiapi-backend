@@ -29,7 +29,19 @@ const CampaignSchema = new mongoose.Schema(
     mediaUrl: { type: String, default: null },
     message: { type: String, default: "" },
 
+    // content that the campaign screen already sends (these were silently dropped before because they were not in the schema)
+    header: { type: String, default: null },
+    footer: { type: String, default: null },
+    buttons: { type: [mongoose.Schema.Types.Mixed], default: [] },
+
+    // 🧩 CUSTOM FIELDS: who was targeted and how variables were filled
+    audienceFilter: { type: mongoose.Schema.Types.Mixed, default: null },      // { match, conditions:[{field,op,value}] }
+    variableMap: { type: mongoose.Schema.Types.Mixed, default: null },         // template {{1}} -> field, e.g. { "1": "first_name", "2": "city|Sir" }
+    missingVariablePolicy: { type: String, enum: ["fallback", "skip"], default: "fallback" },
+    skipStatuses: { type: [String], default: [] },
+
     totalContacts: { type: Number, default: 0 },
+    skippedCount: { type: Number, default: 0 },
     successCount: { type: Number, default: 0 },
     failureCount: { type: Number, default: 0 },
 

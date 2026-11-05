@@ -20,6 +20,9 @@ require("./models/QRCode");
 require("./models/ShortLink");
 require("./models/CtaUrl");
 require("./models/WidgetConfig");
+// 🧩 Custom fields (contact data for {{variables}}, segments and the AI)
+require("./models/CustomField");
+require("./models/ContactFieldHistory");
 
 // ROUTE IMPORTS
 const adminRoutes = require("./routes/adminRoutes");
@@ -258,6 +261,7 @@ app.use('/api/notifications', notificationRoutes);
 app.use("/api/contacts", contactRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/templates", templateRoutes);
+app.use("/api/custom-fields", require("./routes/customFields"));
 app.use("/api/bot-replies", botReplyRoutes);
 app.use("/api/message-logs", messageLogRoutes);
 

@@ -64,6 +64,14 @@ const AiBotSettingsSchema = new mongoose.Schema(
       handoverKeyword: { type: String, default: "" },
       responseDelay: { type: Number, default: 0 },
     },
+
+    // 🧩 CUSTOM FIELDS x AI: what the AI may do with the contact's saved details
+    contactData: {
+      readEnabled: { type: Boolean, default: true },       // AI sees the customer profile (name, city ...) before answering
+      writeEnabled: { type: Boolean, default: true },      // AI saves details the customer tells it (name, city ...)
+      askForMissing: { type: Boolean, default: false },    // AI may politely ask for one missing detail when it fits
+      overwriteManual: { type: Boolean, default: false },  // allow AI to overwrite values your team entered (not recommended)
+    },
   },
   { timestamps: true }
 );
