@@ -10,6 +10,12 @@ const CF = require("../utils/customFields");
 
 const MAX_FIELDS_PER_ACCOUNT = 50;
 
+// Express 5 (path-to-regexp v8) no longer allows a regex inside a path like "/:id([0-9a-fA-F]{24})".
+// Same behaviour, new way: the route only handles real 24-character Mongo ids; anything else is skipped with
+// next("route"), so paths such as PUT "/ai-settings" or POST "/reorder" still reach their own handlers.
+const OBJECT_ID_RE = /^[0-9a-fA-F]{24}$/;
+const onlyObjectId = (req, res, next) => (OBJECT_ID_RE.test(String(req.params.id)) ? next() : next("route"));
+
 // same ownership rules as routes/contacts.js
 function owner(req) {
   const userId = req.user.id || req.user._id;
@@ -90,7 +96,7 @@ router.post("/", auth, async (req, res) => {
 });
 
 // ------------------------------------------------------------- update
-router.put("/:id([0-9a-fA-F]{24})", auth, async (req, res) => {
+router.put("/:id", onlyObjectId, auth, async (req, res) => {
   try {
     const { ownerId, canManage } = owner(req);
     if (!canManage) return deny(res);
@@ -143,7 +149,7 @@ router.post("/reorder", auth, async (req, res) => {
 });
 
 // ------------------------------------------------------------- delete (?purge=true also removes the saved values)
-router.delete("/:id([0-9a-fA-F]{24})", auth, async (req, res) => {
+router.delete("/:id", onlyObjectId, auth, async (req, res) => {
   try {
     const { ownerId, canManage } = owner(req);
     if (!canManage) return deny(res);
