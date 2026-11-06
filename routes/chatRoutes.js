@@ -13,6 +13,7 @@ const Contact = require("../models/Contact");
 const TeamMember = require("../models/TeamMember");
 const AgentActivity = require("../models/AgentActivity");
 const authMiddleware = require("../middleware/auth");
+const CF = require("../utils/customFields"); // 🧩 custom fields: {{variables}} typed by agents
 
 // ⚡ Centralized Baileys Service Import
 const { getActiveSocket, startWhatsAppSession } = require("../routes/whatsappBaileysService");
@@ -338,12 +339,17 @@ router.post("/assignment-mode", authMiddleware, async (req, res) => {
 router.post("/send", authMiddleware, upload.single("file"), async (req, res) => {
   try {
     const to = req.body.to || req.body.recipientId || req.body.recipient_id || req.body.phone || req.body.customerPhone;
-    const text = req.body.text || req.body.message || "";
+    const rawText = req.body.text || req.body.message || "";
     const { type = "text", templateName, languageCode = "en", platform = "whatsapp" } = req.body;
 
     const clientMessageId = req.body.clientMessageId || req.body.fileLocalIdentifier || req.body.tempId || null;
     const businessScopeId = req.user.adminId || req.user.id || req.user._id;
     const userConditions = getAdminQueryFilter(businessScopeId);
+
+    // 🧩 an agent can type {{first_name|there}} / {{city}} ... : filled with the recipient's saved details before sending
+    const text = rawText && String(rawText).includes("{{")
+      ? (await CF.renderForRecipient({ ownerId: businessScopeId, identifier: to, text: String(rawText) })).text
+      : rawText;
 
     if (!to) {
       return res.status(400).json({ 
@@ -1355,6 +1361,17 @@ const validateQuickReplyInput = ({ title, body, category }) => {
   return null;
 };
 
+// 🧩 quick replies may contain {{variables}} (filled when the agent sends them). Unknown names are reported, never blocked.
+const unknownVarsWarning = async (req, text) => {
+  try {
+    const defsMap = await CF.loadDefsMap(req.user.adminId || req.user.id || req.user._id);
+    const unknown = CF.findUnknownVariables([text], defsMap);
+    return unknown.length
+      ? { warnings: { unknownVariables: unknown, message: `Unknown variable(s): ${unknown.map((k) => `{{${k}}}`).join(", ")}. Create the custom field or fix the spelling.` } }
+      : {};
+  } catch (e) { return {}; }
+};
+
 // ROUTE: List quick replies for this business
 router.get("/quick-replies", authMiddleware, async (req, res) => {
   try {
@@ -1380,7 +1397,7 @@ router.post("/quick-replies", authMiddleware, async (req, res) => {
       businessId: businessScopeId,
       createdBy: String(req.user.id || req.user._id || "")
     });
-    return res.status(201).json({ success: true, data: serializeQuickReply(created, req.user) });
+    return res.status(201).json({ success: true, data: serializeQuickReply(created, req.user), ...(await unknownVarsWarning(req, input.body)) });
   } catch (err) {
     if (err.code === 11000) {
       return res.status(409).json({ success: false, message: "A quick reply with this title already exists." });
@@ -1413,7 +1430,7 @@ router.put("/quick-replies/:id", authMiddleware, async (req, res) => {
     existing.body = input.body;
     existing.category = input.category;
     await existing.save();
-    return res.json({ success: true, data: serializeQuickReply(existing, req.user) });
+    return res.json({ success: true, data: serializeQuickReply(existing, req.user), ...(await unknownVarsWarning(req, input.body)) });
   } catch (err) {
     if (err.code === 11000) {
       return res.status(409).json({ success: false, message: "A quick reply with this title already exists." });

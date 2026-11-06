@@ -23,6 +23,8 @@ require("./models/WidgetConfig");
 // 🧩 Custom fields (contact data for {{variables}}, segments and the AI)
 require("./models/CustomField");
 require("./models/ContactFieldHistory");
+// 🆘 Help & Support tickets (dashboard "Help & Support" window)
+require("./models/SupportTicket");
 
 // ROUTE IMPORTS
 const adminRoutes = require("./routes/adminRoutes");
@@ -50,6 +52,8 @@ const chatRoutes = require("./routes/chatRoutes");
 const shortLinkRoutes = require("./routes/shortLinkRoutes");
 const ctaRoutes = require("./routes/ctaRoutes");
 const widgetRoutes = require("./routes/widgetRoutes");
+// 🆘 Help & Support: create / list support tickets
+const supportRoutes = require("./routes/support");
 // 🟢 NEW: public (no-auth) tracking routes + detailed growth analytics
 const publicRoutes = require("./routes/publicRoutes");
 const growthAnalyticsRoutes = require("./routes/growthAnalyticsRoutes");
@@ -262,6 +266,7 @@ app.use("/api/contacts", contactRoutes);
 app.use("/api/groups", groupRoutes);
 app.use("/api/templates", templateRoutes);
 app.use("/api/custom-fields", require("./routes/customFields"));
+app.use("/api/support", supportRoutes);
 app.use("/api/bot-replies", botReplyRoutes);
 app.use("/api/message-logs", messageLogRoutes);
 

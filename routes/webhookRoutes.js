@@ -1728,6 +1728,20 @@ async function processShopifyNotification(shopifyData, topic, userId = null) {
     );
   }
 
+  // 🧩 CUSTOM FIELDS: keep the buyer's store details (last order, orders count, total spent, city ...) on the contact
+  if (CF) {
+    await CF.syncOrderToContact({
+      ownerId: targetUserId || userId,
+      orderOwnerId: targetUserId ? String(targetUserId) : (userId ? String(userId) : "global_store_user"),
+      phone: cleanPhone, name: customerName, source: "shopify", orderId, total: totalPrice, items: itemsList,
+      city: shopifyData.shipping_address?.city || shopifyData.billing_address?.city || shopifyData.customer?.default_address?.city,
+      email: shopifyData.email || shopifyData.customer?.email,
+      orderDate: shopifyData.created_at,
+      isNewOrder: currentOrderStatus === "received",
+      Order,
+    });
+  }
+
   if (messageText) {
     const metaPayload = {
       type: "text",
@@ -1850,6 +1864,20 @@ async function processWooCommerceNotification(wooData, userId = null) {
       },
       { upsert: true, returnDocument: 'after' }
     );
+  }
+
+  // 🧩 CUSTOM FIELDS: keep the buyer's store details (last order, orders count, total spent, city ...) on the contact
+  if (CF) {
+    await CF.syncOrderToContact({
+      ownerId: targetUserId || userId,
+      orderOwnerId: targetUserId ? String(targetUserId) : (userId ? String(userId) : "global_store_user"),
+      phone: cleanPhone, name: customerName, source: "woocommerce", orderId, total: totalPrice, items: itemsList,
+      city: wooData.shipping?.city || wooData.billing?.city,
+      email: wooData.billing?.email,
+      orderDate: wooData.date_created,
+      isNewOrder: ["pending", "pending-payment", "on-hold", "processing"].includes(orderStatus),
+      Order,
+    });
   }
 
   if (messageText) {
