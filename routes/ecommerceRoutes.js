@@ -1,6 +1,8 @@
 const express = require("express");
 const router = express.Router();
 const User = require("../models/User");
+const mongoose = require("mongoose");
+const CF = require("../utils/customFields"); // 🧩 store orders -> contact custom fields
 // Aapka existing WhatsApp messaging service / helper import karein
 const { sendWhatsAppTemplate } = require("../services/whatsappService");
 
@@ -70,6 +72,22 @@ router.post("/woocommerce/order-created/:userId", async (req, res) => {
     const totalAmount = orderData.total;
 
     if (customerPhone) {
+      // 🧩 CUSTOM FIELDS: last order, orders count, total spent, city ... on the contact (never blocks the confirmation below)
+      await CF.syncOrderToContact({
+        ownerId: userId,
+        phone: customerPhone,
+        name: customerName,
+        source: "woocommerce",
+        orderId,
+        total: totalAmount,
+        items: (orderData.line_items || []).map((i) => `${i.name} (x${i.quantity})`).join(", "),
+        city: orderData.shipping?.city || orderData.billing?.city,
+        email: orderData.billing?.email,
+        orderDate: orderData.date_created,
+        isNewOrder: true,
+        Order: mongoose.models.Order || null,
+      });
+
       await sendWhatsAppTemplate({
         adminId: userId,
         to: customerPhone,

@@ -143,7 +143,7 @@ function formatForMessage(def, value) {
 function isPlaceholderName(name, phone) {
   const n = String(name ?? "").trim();
   if (!n) return true;
-  if (/^(unknown( customer)?|customer|direct contact|new contact)$/i.test(n)) return true;
+  if (/^(unknown( customer)?|customer|direct contact|new contact|(instagram|messenger|facebook|whatsapp)?\s*user(\s*\(.*\))?)$/i.test(n)) return true; // incl. auto names like "INSTAGRAM User (1234)"
   const digits = n.replace(/\D/g, "");
   if (digits.length >= 7 && digits.length >= n.replace(/[\s+\-()]/g, "").length) return true; // the name is just a phone number
   return Boolean(phone) && n === String(phone);
@@ -241,29 +241,49 @@ function findUnknownVariables(texts, defsMap = {}) {
 
 const sanitizeMetaParam = (s) => String(s ?? "").replace(/[\r\n\t]+/g, " ").replace(/ {4,}/g, "   ").trim().slice(0, 1024);
 
-/**
- * Meta/QR template variables {{1}}, {{2}} ... filled per contact.
- * variableMap: { "1": "first_name", "2": "city|Sir", "3": "Visit {{city}} branch" }   (or an array)
- * returns { values:[...], missing:[{index,key}] }
- */
-function resolveTemplateValues(variableMap, ctx, defsMap = {}, opts = {}) {
-  if (!variableMap || typeof variableMap !== "object") return { values: [], missing: [] };
-  const entries = Array.isArray(variableMap)
+function variableMapEntries(variableMap) {
+  if (!variableMap || typeof variableMap !== "object") return [];
+  return Array.isArray(variableMap)
     ? variableMap.map((v, i) => [String(i + 1), v])
     : Object.entries(variableMap).filter(([k]) => /^\d+$/.test(k)).sort((a, b) => Number(a[0]) - Number(b[0]));
-  const values = [];
-  const missing = [];
-  entries.forEach(([idx, spec]) => {
-    let s = String(spec ?? "").trim();
-    if (/^[a-z_][a-z0-9_]*(\|.*)?$/i.test(s) && (BUILTIN_VARIABLES.includes(s.split("|")[0].toLowerCase()) || defsMap[s.split("|")[0].toLowerCase()])) s = `{{${s}}}`;
-    const d = renderDetailed(s, ctx, defsMap, { commaSafe: opts.commaSafe });
+}
+
+/**
+ * One variableMap entry -> text with {{variables}}.
+ *   "city"  /  "city|Sir"      a field name (optionally with a fallback)
+ *   "{{city}} branch"          text with variables
+ *   "'Welcome'"  (in quotes)   fixed text, even when it looks like a field name
+ */
+function templateSpecToText(spec) {
+  const s = String(spec ?? "").trim();
+  const quoted = s.match(/^(['"])([\s\S]*)\1$/);
+  if (quoted) return quoted[2];
+  if (/^[a-z_][a-z0-9_]*(\|[^{}]*)?$/i.test(s)) return `{{${s}}}`;
+  return s;
+}
+
+/** fields used in a variableMap that do not exist (typos) - checked before a campaign starts */
+function findUnknownInVariableMap(variableMap, defsMap = {}) {
+  return findUnknownVariables(variableMapEntries(variableMap).map(([, spec]) => templateSpecToText(spec)), defsMap);
+}
+
+/**
+ * Meta/QR template variables {{1}}, {{2}} ... filled per contact.
+ * variableMap: { "1": "first_name", "2": "city|Sir", "3": "Visit {{city}} branch", "4": "'Fixed text'" }   (or an array)
+ * returns { values:[...], missing:[{index,key}], unknown:[key] }
+ */
+function resolveTemplateValues(variableMap, ctx, defsMap = {}, opts = {}) {
+  const values = [], missing = [], unknown = new Set();
+  variableMapEntries(variableMap).forEach(([idx, spec]) => {
+    const d = renderDetailed(templateSpecToText(spec), ctx, defsMap, { commaSafe: opts.commaSafe });
     d.missing.forEach((key) => missing.push({ index: Number(idx), key }));
+    d.unknown.forEach((key) => unknown.add(key));
     let v = sanitizeMetaParam(d.text);
     if (!v && opts.forMeta) v = "-"; // Meta rejects empty template parameters
     values[Number(idx) - 1] = v;
   });
   for (let i = 0; i < values.length; i++) if (values[i] === undefined) values[i] = opts.forMeta ? "-" : "";
-  return { values, missing };
+  return { values, missing, unknown: [...unknown] };
 }
 
 // ---------------------------------------------------------------- definitions (DB, cached)
@@ -666,10 +686,43 @@ function buildSaveContactInfoTool(defsMap = {}) {
   };
 }
 
-async function findContactByPhone(ownerId, phone) {
+/** the contact of a chat: WhatsApp phone number, or the Instagram / Messenger sender id (stored in recipientId) */
+async function findContactByPhone(ownerId, phoneOrId) {
   const { Contact } = models();
-  if (!ownerId || !phone) return null;
-  return (await Contact.findOne({ userId: ownerId, phone }).lean()) || (await Contact.findOne({ adminId: ownerId, phone }).lean());
+  if (!ownerId || !phoneOrId) return null;
+  const queries = [
+    { userId: ownerId, phone: phoneOrId }, { adminId: ownerId, phone: phoneOrId },
+    { userId: ownerId, recipientId: phoneOrId }, { adminId: ownerId, recipientId: phoneOrId },
+  ];
+  for (const q of queries) {
+    const found = await Contact.findOne(q).lean();
+    if (found) return found;
+  }
+  return null;
+}
+
+/**
+ * For messages an AGENT types in the chat ("Hi {{first_name|there}}, ..."): fills the variables of the recipient.
+ * Unknown names stay exactly as typed (so the agent notices), values that are missing become the fallback / empty.
+ * Never throws: on any problem the original text is returned.
+ */
+async function renderForRecipient({ ownerId, identifier, text }) {
+  const original = { text, missing: [], unknown: [], found: false };
+  try {
+    if (!text || !String(text).includes("{{")) return original;
+    const defsMap = await loadDefsMap(ownerId);
+    const raw = String(identifier || "").replace(/@.*$/, "");
+    const digits = raw.replace(/\D/g, "");
+    const candidates = [...new Set([raw, digits, digits.startsWith("03") && digits.length === 11 ? "92" + digits.slice(1) : null].filter(Boolean))];
+    let contact = null;
+    for (const c of candidates) { contact = await findContactByPhone(ownerId, c); if (contact) break; }
+    const ctx = buildContext(contact || { phone: digits }, defsMap);
+    const d = renderDetailed(text, ctx, defsMap, { unknown: "keep" });
+    return { text: d.text, missing: d.missing, unknown: d.unknown, found: Boolean(contact) };
+  } catch (e) {
+    console.warn("⚠️ [CustomFields] could not render variables for the recipient:", e.message);
+    return original;
+  }
 }
 
 /**
@@ -711,9 +764,9 @@ module.exports = {
   FIELD_TYPES, BUILTIN_VARIABLES, RESERVED_KEYS, PROTECTED_SOURCES, TOOL_NAME,
   normalizeKey, isValidKey, isReservedKey, parseJsonLoose, parseDateInput,
   coerceValue, formatForMessage, isPlaceholderName,
-  buildContext, extractVariables, renderDetailed, renderVariables, renderContent, findUnknownVariables, resolveTemplateValues, sanitizeMetaParam,
+  buildContext, extractVariables, renderDetailed, renderVariables, renderContent, findUnknownVariables, findUnknownInVariableMap, templateSpecToText, resolveTemplateValues, sanitizeMetaParam,
   loadDefsMap, invalidateDefs, validateFieldInput,
   buildAudienceQuery, buildGroupFilter, previewAudience,
   applyContactFieldUpdates,
-  buildAiProfileBlock, buildSaveContactInfoTool, findContactByPhone, prepareAiContext,
+  buildAiProfileBlock, buildSaveContactInfoTool, findContactByPhone, renderForRecipient, prepareAiContext,
 };

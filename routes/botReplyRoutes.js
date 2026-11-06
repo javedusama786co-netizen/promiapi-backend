@@ -6,6 +6,8 @@ const fs = require("fs");
 const BotReply = require("../models/BotReply");
 const User = require("../models/User");
 const auth = require("../middleware/auth");
+const Contact = require("../models/Contact");
+const CF = require("../utils/customFields"); // 🧩 custom fields: {{variables}} in replies
 
 const router = express.Router();
 
@@ -104,6 +106,18 @@ const cleanupMedia = async (mediaUrl) => {
 // HELPERS
 // ==========================================
 const getUserId = (req) => req.user.id || req.user._id;
+
+// 🧩 {{variables}}: unknown names (typos / deleted fields) are reported on save but never block it
+const unknownVariablesOf = async (req, { replyText, footerText, buttons }) => {
+  try {
+    const defsMap = await CF.loadDefsMap(req.user.adminId || getUserId(req));
+    const texts = [replyText, footerText, ...(buttons || []).flatMap((b) => [b?.text, b?.url])].filter((t) => typeof t === "string" && t);
+    return CF.findUnknownVariables(texts, defsMap);
+  } catch (e) { return []; }
+};
+const variableWarning = (unknown) => (unknown.length
+  ? { warnings: { unknownVariables: unknown, message: `Unknown variable(s): ${unknown.map((k) => `{{${k}}}`).join(", ")}. Create the custom field or fix the spelling - until then they are sent empty.` } }
+  : {});
 const toBool = (v) => v === true || v === "true" || v === "1" || v === 1;
 
 // ✅ Multiple keywords support ke liye normalization update
@@ -258,7 +272,25 @@ router.post("/test", auth, async (req, res) => {
     const text = String(req.body.text || "").trim();
     if (!text) return res.status(400).json({ success: false, message: "Type a message to test." });
     const rule = await BotReply.findMatch(getUserId(req), text, req.body.level);
-    res.json({ success: true, matched: Boolean(rule), rule });
+    const out = { success: true, matched: Boolean(rule), rule };
+
+    // 🧩 optional: send { contactId } or { sample:{ name, customFields } } to see the reply with that customer's details filled in
+    if (rule && (req.body.contactId || req.body.sample)) {
+      const ownerId = req.user.adminId || getUserId(req);
+      const defsMap = await CF.loadDefsMap(ownerId);
+      let contact = null;
+      if (req.body.contactId && mongoose.isValidObjectId(req.body.contactId)) {
+        contact = await Contact.findOne({ _id: req.body.contactId, $or: [{ userId: ownerId }, { adminId: ownerId }, { userId: getUserId(req) }] }).lean();
+      }
+      if (!contact && req.body.sample && typeof req.body.sample === "object") {
+        contact = { name: req.body.sample.name, phone: req.body.sample.phone, customFields: req.body.sample.customFields || {} };
+      }
+      if (contact) {
+        const r = CF.renderContent({ text: rule.replyText, footer: rule.footerText, buttons: rule.buttons }, CF.buildContext(contact, defsMap), defsMap, { unknown: "keep" });
+        out.preview = { replyText: r.content.text, footerText: r.content.footer, buttons: r.content.buttons, missingValues: r.missing, unknownVariables: r.unknown };
+      }
+    }
+    res.json(out);
   } catch (error) {
     respondError(res, error, "test");
   }
@@ -370,8 +402,9 @@ router.post("/", auth, handleUpload, async (req, res) => {
       isActive: body.isActive === undefined ? true : toBool(body.isActive),
     });
     saved = true;
+    const unknownVars = await unknownVariablesOf(req, data);
 
-    res.status(201).json({ success: true, message: "Reply created.", data: rule });
+    res.status(201).json({ success: true, message: "Reply created.", data: rule, ...variableWarning(unknownVars) });
   } catch (error) {
     respondError(res, error, "create");
   } finally {
@@ -392,6 +425,7 @@ router.put("/:id", auth, handleUpload, async (req, res) => {
     const removeMedia = toBool(body.removeMedia);
     const contentFields = ["botType", "keyword", "matchType", "level", "replyText", "footerText", "templateId", "buttons"];
     const touchesContent = contentFields.some((k) => body[k] !== undefined) || req.file || removeMedia;
+    let unknownVars = [];
 
     if (touchesContent) {
       const { buttons, error: buttonError } =
@@ -423,6 +457,7 @@ router.put("/:id", auth, handleUpload, async (req, res) => {
       if (errors.length) return res.status(400).json({ success: false, message: errors[0], errors });
 
       rule.set(next);
+      unknownVars = await unknownVariablesOf(req, next);
       if (previousMedia && previousMedia !== mediaUrl) res.locals.oldMedia = previousMedia;
     }
 
@@ -432,7 +467,7 @@ router.put("/:id", auth, handleUpload, async (req, res) => {
     saved = true;
     if (res.locals.oldMedia) await cleanupMedia(res.locals.oldMedia);
 
-    res.json({ success: true, message: "Reply updated.", data: rule });
+    res.json({ success: true, message: "Reply updated.", data: rule, ...variableWarning(unknownVars) });
   } catch (error) {
     respondError(res, error, "update");
   } finally {

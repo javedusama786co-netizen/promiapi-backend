@@ -1,8 +1,13 @@
 const express = require("express");
+const mongoose = require("mongoose");
 const router = express.Router();
 const BotFlow = require("../models/BotFlow");
 const User = require("../models/User"); // User Model for fetching subscription plans dynamically
 const auth = require("../middleware/auth");
+const CF = require("../utils/customFields"); // 🧩 custom fields: {{variables}} in flow messages
+
+// node fields that are sent to the customer (same list the bot engines render)
+const FLOW_TEXT_KEYS = ["message", "text", "caption", "body", "footer", "footerText", "title", "label", "headerText", "header"];
 
 // 1. SAVE OR UPDATE BOT FLOW (WITH DYNAMIC SUBSCRIPTION PLAN LIMITS)
 router.post("/save", auth, async (req, res) => {
@@ -26,6 +31,27 @@ router.post("/save", auth, async (req, res) => {
         nextLevel: node.data?.nextLevel ? String(node.data.nextLevel).trim().toUpperCase() : "ANY",
       },
     }));
+
+    // 🧩 CUSTOM FIELDS: warn (never block) when a node uses a {{variable}} that does not exist
+    let unknownVariables = [];
+    try {
+      const ownerId = req.user?.adminId || userId;
+      if (mongoose.Types.ObjectId.isValid(String(ownerId))) {
+        const defsMap = await CF.loadDefsMap(ownerId);
+        const texts = [];
+        sanitizedNodes.forEach((n) => {
+          const d = n.data || {};
+          FLOW_TEXT_KEYS.forEach((k) => { if (typeof d[k] === "string") texts.push(d[k]); });
+          (Array.isArray(d.buttons) ? d.buttons : []).forEach((btn) => {
+            if (typeof btn === "string") texts.push(btn);
+            else if (btn) [btn.text, btn.title, btn.label, btn.url].forEach((t) => { if (typeof t === "string") texts.push(t); });
+          });
+        });
+        unknownVariables = CF.findUnknownVariables(texts, defsMap);
+      }
+    } catch (e) {
+      console.warn("Flow variable check skipped:", e.message);
+    }
 
     // Extract trigger keyword from triggerNode/startNode
     const triggerNode = sanitizedNodes.find(
@@ -102,6 +128,9 @@ router.post("/save", auth, async (req, res) => {
       success: true,
       message: "Bot Flow saved successfully with Level Mapping! 🚀",
       flow,
+      ...(unknownVariables.length
+        ? { warnings: { unknownVariables, message: `Unknown variable(s): ${unknownVariables.map((k) => `{{${k}}}`).join(", ")}. Create the custom field or fix the spelling - until then they are sent empty.` } }
+        : {}),
     });
   } catch (error) {
     console.error("Save Flow Error:", error);
