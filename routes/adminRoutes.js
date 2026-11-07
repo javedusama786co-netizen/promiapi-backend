@@ -43,6 +43,11 @@ const isSelf = (req, id) => String(req.user._id) === String(id);
 const blockSelf = (res) =>
   res.status(400).json({ success: false, message: "You cannot do this to the owner account." });
 
+// SUPPORT DESK: the customers' Help & Support tickets (list / reply / close).
+// The owner check MUST be passed explicitly here, because this file protects each route one by one
+// (verifyOwnerAdmin). Result: /api/admin/support/tickets, only for the owner.
+router.use("/support", verifyOwnerAdmin, require("./supportAdmin"));
+
 // 1. GET ALL USERS (every field except password)
 router.get("/users", verifyOwnerAdmin, async (req, res) => {
   try {
