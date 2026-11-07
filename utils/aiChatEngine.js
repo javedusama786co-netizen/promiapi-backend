@@ -1,9 +1,8 @@
 const { OpenAI } = require("openai");
-const axios = require("axios"); // 🟢 Flowise requests bhejne ke liye axios import kiya hai
 const AiSettings = require("../models/AiSettings");
 
 /**
- * Core Processing Engine For Inbound Messages (Supports OpenAI & Flowise)
+ * Core Processing Engine For Inbound Messages (direct OpenAI; FlowiseAI support was removed)
  * @param {string} vendorId - Message pipeline target reference
  * @param {string} incomingMessage - Client query input
  * @param {string} clientPhoneNumber - Target phone number
@@ -30,29 +29,8 @@ async function processIncomingWithAI(vendorId, incomingMessage, clientPhoneNumbe
 
     let aiReply = "";
 
-    // 🟢 PATHWAY A: FlowiseAI Webhook Route
-    if (config.botPlatform === "flowise") {
-      if (!config.flowiseApiUrl) return;
-
-      try {
-        // Flowise prediction API ko hit karna
-        const response = await axios.post(config.flowiseApiUrl, {
-          question: incomingMessage
-        });
-
-        // Flowise standard output key 'text' ya string response handle karna
-        aiReply = response.data?.text || response.data;
-      } catch (flowiseError) {
-        console.error("Flowise webhook routing failure:", flowiseError.message);
-        if (config.fallbackReply) {
-          aiReply = config.fallbackReply;
-        } else {
-          return; // Fallback nahi hai to exit
-        }
-      }
-    } 
-    // 🟡 PATHWAY B: Direct OpenAI API Route (Default Failover)
-    else {
+    // Direct OpenAI API route
+    {
       if (!config.openaiApiKey) return;
 
       const openai = new OpenAI({ apiKey: config.openaiApiKey });

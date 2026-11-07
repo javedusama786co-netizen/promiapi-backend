@@ -14,23 +14,32 @@ const AiBotSettingsSchema = new mongoose.Schema(
       enableForNewContacts: { type: Boolean, default: false },
     },
 
-    // 🤖 AI provider settings.
-    // NOTE: the key is still called "openai" so the existing dashboard/API keep working,
-    // but the backend now sends these values to GROQ (https://api.groq.com/openai/v1).
-    //   apiKey -> your GROQ API key (starts with gsk_...)
-    //   model  -> a GROQ model id. OpenAI names (gpt-4o etc.) and retired Llama models are auto-replaced in code.
-    openai: {
-      enabled: { type: Boolean, default: false },
+    // 🤖 Two AI providers, both can be ON at the same time. They share the same engine (see processAiBotResponse
+    // in webhookRoutes.js and whatsappBaileysService.js).
+    //
+    // GROQ  -> settings.groq    apiKey starts with gsk_..., model is a Groq model id (default openai/gpt-oss-120b)
+    // OPENAI -> settings.openai apiKey starts with sk-...,  model is an OpenAI model id (default gpt-4o-mini)
+    //
+    // `groq.enabled` has NO default on purpose: older documents (before the groq block existed) kept their Groq key
+    // inside `openai`, and the server detects them by "groq.enabled is undefined".
+    groq: {
+      enabled: { type: Boolean },
       apiKey: { type: String, default: "" },
       model: { type: String, default: "openai/gpt-oss-120b" },
       systemPrompt: { type: String, default: "" },
       temperature: { type: Number, default: 0.7 },
     },
 
-    flowise: {
+    openai: {
       enabled: { type: Boolean, default: false },
-      apiUrl: { type: String, default: "" },
+      apiKey: { type: String, default: "" },
+      model: { type: String, default: "gpt-4o-mini" },
+      systemPrompt: { type: String, default: "" }, // empty = use the Groq instructions
+      temperature: { type: Number, default: 0.7 },
     },
+
+    // Which provider answers first when both are ON (the other one is the automatic backup)
+    aiProvider: { type: String, enum: ["groq", "openai"], default: "groq" },
 
     // 🌐 External Server / Bank CBS API Settings
     externalApi: {

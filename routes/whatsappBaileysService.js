@@ -406,9 +406,104 @@ function resolveGroqApiKey(settings) {
   ];
   for (const c of candidates) {
     const key = String(c || "").replace(/^["']|["']$/g, "").trim();
-    if (key) return key;
+    if (key && !/^sk-/.test(key)) return key; // sk-... is an OpenAI key (second provider), not a Groq key
   }
   return null;
+}
+
+// =========================================================================
+// 🤖 SECOND PROVIDER: OpenAI (same engine, prompt rules and tools as Groq). Replaces the old FlowiseAI option.
+//    Groq and OpenAI can both be ON: the "primary" one answers first (settings.aiProvider, default Groq) and if it
+//    fails (no credit, rate limit, outage ...) the other one answers automatically.
+// =========================================================================
+const OPENAI_API_URL = "https://api.openai.com/v1/chat/completions";
+// Override anytime with OPENAI_MODEL in .env
+const OPENAI_DEFAULT_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+// reasoning models (o-series, gpt-5): no custom temperature, tokens are set with max_completion_tokens
+const OPENAI_REASONING_RE = /^(o\d|gpt-5)/i;
+const DEFAULT_AI_PERSONA = "You are a helpful customer support assistant on WhatsApp. Reply briefly and clearly in the customer's language.";
+
+const cleanApiKey = (v) => String(v || "").replace(/^["']|["']$/g, "").trim();
+const looksLikeOpenAiKey = (k) => /^sk-/.test(cleanApiKey(k));
+
+function resolveOpenAiApiKey(settings) {
+  for (const c of [settings?.openai?.apiKey, settings?.openaiApiKey, process.env.OPENAI_API_KEY]) {
+    const key = cleanApiKey(c);
+    if (key && looksLikeOpenAiKey(key)) return key; // a Groq key (gsk_...) must never be sent to OpenAI
+  }
+  return null;
+}
+
+function resolveOpenAiModel(settings) {
+  const requested = String(settings?.openai?.model || "").trim();
+  if (!requested) return OPENAI_DEFAULT_MODEL;
+  // Groq / open-source model names (openai/gpt-oss-120b, llama..., mixtral...) do not exist on OpenAI
+  if (/\//.test(requested) || /^(llama|mixtral|gemma|deepseek|qwen|mistral|compound|whisper)/i.test(requested)) {
+    console.warn(`⚠️ [QR OPENAI] "${requested}" is not an OpenAI model name -> using "${OPENAI_DEFAULT_MODEL}"`);
+    return OPENAI_DEFAULT_MODEL;
+  }
+  return requested;
+}
+
+// Every provider that is switched ON and has a usable key, primary first.
+function getAiProviders(settings) {
+  const providers = [];
+  const skipped = [];
+
+  const groqKey = resolveGroqApiKey(settings);
+  // old settings documents: "openai.enabled" with a gsk_ key used to mean "AI on" (it was really Groq)
+  const legacyGroqOn = settings?.groq?.enabled === undefined && settings?.openai?.enabled === true && !looksLikeOpenAiKey(settings?.openai?.apiKey);
+  const groqOn = settings?.groq?.enabled === true || legacyGroqOn;
+  if (groqOn) {
+    if (groqKey) {
+      providers.push({
+        provider: "groq", label: "Groq", logTag: "QR GROQ", url: GROQ_API_URL, apiKey: groqKey,
+        model: resolveGroqModel(settings),
+        temperature: settings.groq?.temperature ?? settings.openai?.temperature ?? 0.7,
+        systemPrompt: settings.groq?.systemPrompt || settings.openai?.systemPrompt || DEFAULT_AI_PERSONA,
+      });
+    } else {
+      skipped.push("Groq is ON but no Groq API key was found (groq.apiKey / GROQ_API_KEY)");
+    }
+  }
+
+  if (settings?.openai?.enabled === true) {
+    const openaiKey = resolveOpenAiApiKey(settings);
+    if (openaiKey) {
+      providers.push({
+        provider: "openai", label: "OpenAI", logTag: "QR OPENAI", url: OPENAI_API_URL, apiKey: openaiKey,
+        model: resolveOpenAiModel(settings),
+        temperature: settings.openai?.temperature ?? 0.7,
+        systemPrompt: settings.openai?.systemPrompt || settings.groq?.systemPrompt || DEFAULT_AI_PERSONA,
+      });
+    } else if (!legacyGroqOn) {
+      skipped.push("OpenAI is ON but no OpenAI API key (sk-...) was found (openai.apiKey / OPENAI_API_KEY)");
+    }
+  }
+
+  const primary = String(settings?.aiProvider || settings?.general?.aiProvider || "groq").toLowerCase();
+  if (primary === "openai") providers.sort((a, b) => (a.provider === "openai" ? -1 : 1) - (b.provider === "openai" ? -1 : 1));
+  return { providers, skipped };
+}
+
+// request body per provider (same OpenAI-compatible chat format)
+function buildChatBody(cfg, messages, temperature, flags = {}) {
+  const body = { model: cfg.model, messages };
+  const t = Math.min(temperature, 0.5);
+  if (cfg.provider === "openai") {
+    if (OPENAI_REASONING_RE.test(cfg.model)) {
+      body.max_completion_tokens = 2000; // reasoning tokens count too
+      body.reasoning_effort = "low";
+    } else {
+      if (!flags.dropTemperature) body.temperature = t;
+      if (flags.legacyTokens) body.max_tokens = 700; else body.max_completion_tokens = 700;
+    }
+  } else {
+    body.temperature = t;
+    body.max_tokens = 700;
+    if (/gpt-oss/i.test(cfg.model)) body.reasoning_effort = "low"; // less hidden "thinking" tokens, faster replies
+  }
+  return body;
 }
 
 function buildGroqTools(settings) {
@@ -441,10 +536,8 @@ function clampForWhatsApp(text) {
   return (cut > WA_MAX_REPLY_CHARS * 0.6 ? slice.slice(0, cut + 1) : slice).trim();
 }
 
-async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
-  const model = resolveGroqModel(settings);
-  const temperature = settings.groq?.temperature ?? settings.openai?.temperature ?? 0.7;
-  const systemPrompt = settings.groq?.systemPrompt || settings.openai?.systemPrompt || "You are a helpful customer support assistant on WhatsApp. Reply briefly and clearly in the customer's language.";
+async function runChatCompletion(cfg, userId, customerPhone, userText, settings) {
+  const { apiKey, model, temperature, systemPrompt } = cfg;
 
   const waRules = "\n\nIMPORTANT RULES (WhatsApp channel):\n1. Answer ONLY what the customer asked in their latest message. Do NOT add extra details, other services, features or integrations they did not ask about.\n2. Never write one big paragraph. Use short lines separated by blank lines. For how-to questions use a numbered list (maximum 6 steps, one short line each). For other questions use 2-4 short sentences. Stay under 900 characters.\n3. If the question is broad (for example 'tell me your services' or 'details'), give a ONE-line overview and ask which specific thing they want to know more about.\n4. Do not repeat information that was already given earlier in the chat.\n5. Plain text only: no markdown tables, no # headings. Use *single asterisks* for bold, and '1.' or '-' for lists.\n6. Reply in the same language and script the customer writes in.\n7. Tone: polite, professional and friendly. Use at most one emoji. End with one short line offering further help.";
   // 🧩 CUSTOM FIELDS x AI: the customer's saved details go into the prompt, and the AI gets a tool to save new ones
@@ -452,11 +545,11 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
   if (CF) cfAi = await CF.prepareAiContext({ ownerId: userId, customerPhone, settings });
   const messages = [{ role: "system", content: systemPrompt + waRules + (cfAi?.profileBlock || "") }];
 
-  // ChatMessage has NO createdAt field (only `timestamp`): sort by timestamp to get the most RECENT messages.
+  // NOTE: ChatMessage schema has NO createdAt field (only `timestamp`). Sorting by createdAt returned the OLDEST messages, so the AI "forgot" the recent chat.
   const chatHistory = await ChatMessage.find({ userId, customerPhone }).sort({ timestamp: -1, _id: -1 }).limit(12).lean();
   const history = chatHistory.reverse()
     .map((m) => ({ role: m.sender === "me" ? "assistant" : "user", content: typeof m.text === "string" ? m.text.trim() : "" }))
-    .filter((m) => m.content); // Groq rejects empty message content
+    .filter((m) => m.content); // the API rejects empty message content (media-only messages have no text)
 
   // The incoming message is usually already saved in DB -> avoid sending it twice
   const lastHist = history[history.length - 1];
@@ -466,32 +559,40 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
 
   let tools = buildGroqTools(settings);
   if (cfAi?.tool) tools.push(cfAi.tool);
-  console.log(`🤖 [QR GROQ] Calling model=${model} | user=${userId} | customer=${customerPhone} | history=${history.length} | tools=${tools.length}`);
+  const tag = cfg.logTag;
+  console.log(`🤖 [${tag}] Calling model=${model} | user=${userId} | customer=${customerPhone} | history=${history.length} | tools=${tools.length}`);
 
-  for (let round = 0; round < 3; round++) {
-    const body = { model, messages, temperature: Math.min(temperature, 0.5), max_tokens: 700 };
-    if (/gpt-oss/i.test(model)) body.reasoning_effort = "low"; // less hidden "thinking" tokens, faster replies
+  const flags = { dropTemperature: false, legacyTokens: false };
+
+  for (let round = 0; round < 4; round++) {
+    const body = buildChatBody(cfg, messages, temperature, flags);
     if (tools.length) { body.tools = tools; body.tool_choice = "auto"; }
 
     let aiRes;
     try {
-      aiRes = await axios.post(GROQ_API_URL, body, {
+      aiRes = await axios.post(cfg.url, body, {
         headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
         timeout: 30000
       });
     } catch (err) {
-      // Some Groq models occasionally fail tool-calling (400) -> retry once without tools
-      if (err.response?.status === 400 && tools.length) {
-        console.warn("⚠️ [QR GROQ] 400 with tools, retrying without tools:", JSON.stringify(err.response?.data));
-        tools = [];
-        continue;
+      const status = err.response?.status;
+      const errText = JSON.stringify(err.response?.data) || err.message;
+      if (status === 400) {
+        // some models do not accept a custom temperature / the newer token parameter / tool calls: adapt once and retry
+        if (!flags.dropTemperature && body.temperature !== undefined && /temperature/i.test(errText)) { flags.dropTemperature = true; continue; }
+        if (cfg.provider === "openai" && !flags.legacyTokens && /max_completion_tokens/i.test(errText)) { flags.legacyTokens = true; continue; }
+        if (tools.length) { console.warn(`⚠️ [${tag}] 400 with tools, retrying without tools:`, errText); tools = []; continue; }
       }
-      console.error(`❌ [QR GROQ] Request failed | status=${err.response?.status || "no-response"} |`, JSON.stringify(err.response?.data) || err.message);
+      const hint = status === 401 ? "the API key is invalid or revoked"
+        : status === 429 ? "rate limit reached or no credit / quota left on this account"
+        : status === 404 ? "the model name does not exist or this key has no access to it"
+        : "";
+      console.error(`❌ [${tag}] Request failed | status=${status || "no-response"} |${hint ? ` (${hint}) |` : ""}`, errText);
       return null;
     }
 
     const msg = aiRes.data?.choices?.[0]?.message;
-    if (!msg) { console.error("❌ [QR GROQ] Empty response:", JSON.stringify(aiRes.data)); return null; }
+    if (!msg) { console.error(`❌ [${tag}] Empty response:`, JSON.stringify(aiRes.data)); return null; }
 
     if (msg.tool_calls && msg.tool_calls.length > 0) {
       messages.push({ role: "assistant", content: msg.content || "", tool_calls: msg.tool_calls });
@@ -510,10 +611,10 @@ async function runGroqChat(userId, customerPhone, userText, settings, apiKey) {
       ? msg.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim()
       : "";
     if (content) {
-      console.log(`✅ [QR GROQ] Reply generated (${content.length} chars)`);
+      console.log(`✅ [${tag}] Reply generated (${content.length} chars)`);
       return clampForWhatsApp(content);
     }
-    console.warn("⚠️ [QR GROQ] Model returned empty content");
+    console.warn(`⚠️ [${tag}] Model returned empty content`);
     return null;
   }
   return null;
@@ -537,32 +638,15 @@ async function processAiBotResponse(userId, customerPhone, userText) {
 
     // (the "Simulated Typing Delay" is applied right before sending, see waitReplyDelay)
 
-    if (settings.flowise?.enabled && settings.flowise?.apiUrl) {
-      try {
-        const flowiseRes = await axios.post(
-          settings.flowise.apiUrl,
-          { question: userText },
-          { timeout: 30000 }
-        );
-        const text = flowiseRes.data?.text || flowiseRes.data?.textResponse || flowiseRes.data;
-        if (typeof text === "string" && text.trim()) {
-          return text.trim();
-        }
-      } catch (fErr) {
-        console.error("❌ [QR] Flowise Request Failed:", fErr.message);
-      }
-    }
-
-    const aiEnabled = settings.openai?.enabled === true || settings.groq?.enabled === true;
-    const apiKey = resolveGroqApiKey(settings);
-
-    if (!aiEnabled) {
-      console.log(`⛔ [QR AI SKIP] AI toggle is OFF in settings (openai.enabled / groq.enabled) for user=${userId}`);
-    } else if (!apiKey) {
-      console.log(`⛔ [QR AI SKIP] No Groq API key found (checked groq.apiKey, openai.apiKey, openaiApiKey, GROQ_API_KEY env) for user=${userId}`);
+    const { providers, skipped } = getAiProviders(settings);
+    if (providers.length === 0) {
+      console.log(`⛔ [QR AI SKIP] No AI provider is ready for user=${userId}: ${skipped.join(" | ") || "AI toggle is OFF in settings (groq.enabled / openai.enabled)"}`);
     } else {
-      const reply = await runGroqChat(userId, customerPhone, userText, settings, apiKey);
-      if (reply) return reply;
+      for (const cfg of providers) {
+        const reply = await runChatCompletion(cfg, userId, customerPhone, userText, settings);
+        if (reply) return reply;
+        console.warn(`⚠️ [QR AI] ${cfg.label} gave no reply${providers.length > 1 ? " -> trying the next provider" : ""}`);
+      }
     }
 
     if (settings.general?.failedMessage) {
@@ -1803,7 +1887,7 @@ async function handleInboundMessage(sock, userId, msg) {
   let typingShown = false;
   try {
     const activeFlowCount = await BotFlow.countDocuments({ userId, isActive: true });
-    const botMayReply = activeFlowCount > 0 || botSettings?.openai?.enabled === true || botSettings?.groq?.enabled === true || botSettings?.flowise?.enabled === true;
+    const botMayReply = activeFlowCount > 0 || botSettings?.openai?.enabled === true || botSettings?.groq?.enabled === true;
     if (botMayReply) {
       await sock.sendPresenceUpdate("composing", exactRemoteJid);
       typingShown = true;
